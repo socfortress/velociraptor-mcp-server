@@ -466,6 +466,44 @@ Visit the [Actions page](https://github.com/socfortress/velociraptor-mcp-server/
 
 ---
 
+## Optional: per-call admission gate on RunVQLQueryTool
+
+**Off by default — nothing below changes any behavior unless you opt in.**
+
+Today, `VELOCIRAPTOR_DISABLED_TOOLS` / `VELOCIRAPTOR_DISABLED_CATEGORIES` are
+the only controls on `RunVQLQueryTool`: the whole tool is on or off for
+every caller, with no distinction between a read-only query and one that
+runs a remediation artifact (quarantine, kill, delete) against a live
+endpoint.
+
+If you want finer control than that, install
+[`tulip-agents`](https://github.com/tuliplabs-ai/sdk-python) (a separate,
+optional package — not installed by default, not required) and set:
+
+```env
+VELOCIRAPTOR_TULIP_GATE_ENABLED=true
+```
+
+With that set, each `RunVQLQueryTool` call is classified and weighed against
+a policy before it runs:
+
+- benign read queries — execute as normal
+- queries that match a remediation/mutation pattern (quarantine, uninstall,
+  delete, rekey, cleanup, etc.) — held for a human, not silently run
+- every decision either way lands on a tamper-evident, hash-chained audit
+  record (`tulip_gate.audit_trail()`)
+
+This was validated against this project's own real 324-artifact built-in
+catalog, not a couple of hand-picked examples — see this feature's PR
+description for the full methodology, including the two false positives
+and two real misses that validation found. It's a keyword-based classifier,
+not a claim of a complete or production-grade risk engine, and there's no
+human-approval-and-resume UI wired up yet — a held query is blocked, full
+stop. Treat this as a starting point for finer-grained control, not a
+finished product.
+
+---
+
 ## Security Considerations
 
 ### Credentials Management

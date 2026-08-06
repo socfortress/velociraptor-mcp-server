@@ -10,6 +10,7 @@ from typing import Optional
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+from . import tulip_gate
 from .client import VelociraptorClient
 from .config import Config
 
@@ -239,8 +240,30 @@ class VelociraptorMCPServer:
                     if client.stub is None:
                         await client.authenticate()
 
-                    # Execute the VQL query using the client's run_vql_query method
-                    results = client.run_vql_query(args.vql)
+                    # Execute the VQL query using the client's run_vql_query method.
+                    # Optional: if VELOCIRAPTOR_TULIP_GATE_ENABLED is set and
+                    # tulip-agents is installed, this call is routed through a
+                    # per-call admission gate first (see tulip_gate.py) instead
+                    # of running unconditionally. Off by default — with the
+                    # gate disabled this is identical to the call above.
+                    if tulip_gate.gate_enabled():
+                        try:
+                            results = await tulip_gate.gated_run_vql_query(
+                                args.vql,
+                                lambda: asyncio.to_thread(client.run_vql_query, args.vql),
+                            )
+                        except tulip_gate.GateBlocked as e:
+                            return [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        f"Query blocked by the tulip-agents admission gate "
+                                        f"({e.outcome}): {e.reason}"
+                                    ),
+                                },
+                            ]
+                    else:
+                        results = client.run_vql_query(args.vql)
 
                     # Format the response
                     response_text = json.dumps(results, indent=2)

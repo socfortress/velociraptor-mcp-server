@@ -2,3 +2,9 @@ fastmcp>=0.4
 httpx[http2]>=0.27
 pydantic>=2.7
 PyYAML>=6.0
+
+# Optional, not installed by default: enables the per-call admission gate on
+# RunVQLQueryTool (see velociraptor_mcp_server/tulip_gate.py). Install with
+# `pip install tulip-agents` and set VELOCIRAPTOR_TULIP_GATE_ENABLED=true to
+# opt in — everything runs exactly as it does today without it.
+# tulip-agents>=2.4
