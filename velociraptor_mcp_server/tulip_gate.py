@@ -28,12 +28,32 @@ blocked, full stop — there's no queue or UI yet for a human to review and
 release it. `tulip-agents` has the primitives for that (an interrupt/resume
 mechanism plus checkpoint backends), but wiring an actual approval workflow
 is separate work, not included here.
+
+**Known evasion, found by adversarial probing, disclosed rather than hidden:**
+this classifier reads the literal submitted VQL text. It was confirmed —
+live, end to end, against a real server — that fragmenting a dangerous
+artifact name across concatenated string variables defeats it completely:
+
+    LET p1 = "Windows.Reme" LET p2 = "diation.Quaran" LET p3 = "tine"
+    SELECT * FROM Artifact.call(name=p1 + p2 + p3, ClientId='C.1')
+
+None of `p1`/`p2`/`p3` individually contain a complete marker word, so
+nothing is flagged — yet Velociraptor resolves the concatenation at
+execution time and genuinely runs `Windows.Remediation.Quarantine`. This
+ran as `ALLOWED AND EXECUTED` in testing. Mitigated here by flagging any
+`Artifact.call(name=...)` whose `name` argument is not a single literal
+string as dangerous outright, regardless of marker matches — dynamic
+artifact-name resolution is itself the signal, since a static text scan
+structurally cannot see through string concatenation, encoding, or any
+other runtime-computed value. This closes the specific case found; it is
+not a claim that every such technique is now covered.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
@@ -61,6 +81,15 @@ _DANGEROUS_MARKERS = (
     "remediation", "quarantine", "kill", "delete", "remove", "uninstall",
     "disable", "reset", "wipe", "format", "upgrade", "install",
     "cleanup", "rekey",
+)
+
+# Matches Artifact.call(... name=<not a plain literal string> ...) — see the
+# "Known evasion" note above. A literal name is `name="X"` or `name='X'`
+# immediately closed by a comma or the closing paren; anything else
+# (a variable, a `+` concatenation, a function call) trips this.
+_DYNAMIC_ARTIFACT_CALL = re.compile(
+    r"artifact\.call\s*\([^)]*\bname\s*=\s*(?!['\"][^'\"]*['\"]\s*[,)])",
+    re.IGNORECASE,
 )
 
 _state: dict[str, Any] = {}
@@ -92,14 +121,20 @@ def gate_enabled() -> bool:
 
 
 def _classify(vql: str) -> "Action":
-    is_dangerous = any(marker in vql.lower() for marker in _DANGEROUS_MARKERS)
+    marker_hit = any(marker in vql.lower() for marker in _DANGEROUS_MARKERS)
+    dynamic_artifact_name = bool(_DYNAMIC_ARTIFACT_CALL.search(vql))
+    is_dangerous = marker_hit or dynamic_artifact_name
     return Action(
         name="RunVQLQueryTool",
         asset="velociraptor-fleet",
         blast_radius=50 if is_dangerous else 1,
         environment=os.getenv("VELOCIRAPTOR_TULIP_ENVIRONMENT", "production"),
         kind="dfir-remediation" if is_dangerous else "dfir-query",
-        tags=frozenset({"dangerous"}) if is_dangerous else frozenset(),
+        tags=(
+            frozenset({"dangerous", "dynamic-artifact-name"})
+            if dynamic_artifact_name
+            else frozenset({"dangerous"}) if marker_hit else frozenset()
+        ),
     )
 
 

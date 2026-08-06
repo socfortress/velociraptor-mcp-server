@@ -69,3 +69,31 @@ class TestClassify:
         assert "dangerous" in tulip_gate._classify(
             "SELECT * FROM Artifact.MacOS.System.QuarantineEvents()"
         ).tags
+
+
+class TestDynamicArtifactNameEvasion:
+    """Found by adversarial probing, confirmed live end-to-end against a real
+    server (ALLOWED AND EXECUTED before this fix) — see tulip_gate.py's
+    module docstring. Fragmenting a dangerous artifact name across
+    concatenated VQL variables defeats plain marker matching entirely,
+    since no complete marker word survives in the literal submitted text."""
+
+    def test_fragmented_concatenation_is_now_caught(self):
+        vql = (
+            'LET p1 = "Windows.Reme" LET p2 = "diation.Quaran" LET p3 = "tine" '
+            "SELECT * FROM Artifact.call(name=p1 + p2 + p3, ClientId='C.1')"
+        )
+        action = tulip_gate._classify(vql)
+        assert "dangerous" in action.tags
+        assert "dynamic-artifact-name" in action.tags
+
+    def test_literal_artifact_call_with_a_real_marker_is_caught_as_before(self):
+        vql = 'SELECT * FROM Artifact.call(name="Windows.Remediation.Quarantine", ClientId=\'C.1\')'
+        assert "dangerous" in tulip_gate._classify(vql).tags
+
+    def test_benign_literal_artifact_call_is_not_flagged(self):
+        """The mitigation targets *dynamic* name resolution, not
+        Artifact.call() itself — a literal, benign artifact name must not
+        get swept up as collateral damage."""
+        vql = 'SELECT * FROM Artifact.call(name="Generic.Client.Info", ClientId=\'C.1\')'
+        assert "dangerous" not in tulip_gate._classify(vql).tags
