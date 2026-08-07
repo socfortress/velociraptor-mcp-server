@@ -10,7 +10,20 @@ for anyone who doesn't opt in.
 import os
 from unittest.mock import patch
 
+import pytest
+
 from velociraptor_mcp_server import tulip_gate
+
+# _classify() returns a real tulip.control.Action, so tests that call it
+# directly (rather than going through gate_enabled(), which already guards
+# this correctly) need tulip-agents importable. Skip cleanly rather than
+# crash with a NameError when it isn't installed -- which, unguarded, is
+# exactly what happened: a plain `pytest` on a fresh checkout without the
+# optional extra failed 7 tests here instead of skipping them.
+_needs_tulip = pytest.mark.skipif(
+    not tulip_gate._TULIP_AVAILABLE,
+    reason="tulip-agents is not installed -- _classify() returns a tulip.control.Action",
+)
 
 
 class TestGateEnabled:
@@ -33,6 +46,7 @@ class TestGateEnabled:
                 assert tulip_gate.gate_enabled() is False
 
 
+@_needs_tulip
 class TestClassify:
     """Validated against Velociraptor's real 324-artifact built-in catalog
     (see this feature's PR description for the full methodology). These
@@ -71,6 +85,7 @@ class TestClassify:
         ).tags
 
 
+@_needs_tulip
 class TestDynamicArtifactNameEvasion:
     """Found by adversarial probing, confirmed live end-to-end against a real
     server (ALLOWED AND EXECUTED before this fix) — see tulip_gate.py's
