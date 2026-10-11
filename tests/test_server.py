@@ -299,10 +299,8 @@ class TestVelociraptorMCPServer:
         assert hasattr(result, "content")
         assert len(result.content) == 1
         assert hasattr(result.content[0], "text")
-        # The result.content[0].text contains a JSON array with one element that has the actual data
-        outer_data = json.loads(result.content[0].text)
-        assert len(outer_data) == 1
-        result_data = json.loads(outer_data[0]["text"])
+        # Tools return their text directly (no JSON-encoded wrapper).
+        result_data = json.loads(result.content[0].text)
         assert len(result_data) == 2
         assert result_data[0]["client_id"] == "C.1234567890"
         mock_client.run_vql_query.assert_called_once_with(
@@ -345,10 +343,8 @@ class TestVelociraptorMCPServer:
         assert hasattr(result, "content")
         assert len(result.content) == 1
         assert hasattr(result.content[0], "text")
-        # The result.content[0].text contains a JSON array with one element that has the actual data
-        outer_data = json.loads(result.content[0].text)
-        assert len(outer_data) == 1
-        response_data = json.loads(outer_data[0]["text"])
+        # Tools return their text directly (no JSON-encoded wrapper).
+        response_data = json.loads(result.content[0].text)
 
         # Check that we have the expected artifacts
         assert len(response_data) == 2
@@ -402,10 +398,8 @@ class TestVelociraptorMCPServer:
         assert hasattr(result, "content")
         assert len(result.content) == 1
         assert hasattr(result.content[0], "text")
-        # The result.content[0].text contains a JSON array with one element that has the actual data
-        outer_data = json.loads(result.content[0].text)
-        assert len(outer_data) == 1
-        response_data = json.loads(outer_data[0]["text"])
+        # Tools return their text directly (no JSON-encoded wrapper).
+        response_data = json.loads(result.content[0].text)
 
         # Check that we have the expected artifacts
         assert len(response_data) == 2

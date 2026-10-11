@@ -1,0 +1,19 @@
+.git
+.github
+.venv
+venv
+.env
+.env.*
+!.env.example
+# Velociraptor API client configs hold private keys: never bake them into an image.
+api.config.yaml
+*.config.yaml
+!api.config.yaml.template
+build
+dist
+*.egg-info
+**/__pycache__
+**/*.pyc
+.pytest_cache
+tests
+scripts
