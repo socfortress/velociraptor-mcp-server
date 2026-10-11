@@ -15,6 +15,7 @@ class VelociraptorConfig:
     api_key: str  # Path to api.config.yaml file or direct API key
     ssl_verify: bool = True
     timeout: int = 30
+    max_rows: int = 1000  # Server-side cap on rows returned by any query
 
     @classmethod
     def from_env(cls, prefix: str = "VELOCIRAPTOR") -> "VelociraptorConfig":
@@ -24,6 +25,7 @@ class VelociraptorConfig:
             ssl_verify=os.getenv(f"{prefix}_SSL_VERIFY", "true").lower()
             not in {"0", "false", "no"},
             timeout=int(os.getenv(f"{prefix}_TIMEOUT", "30")),
+            max_rows=int(os.getenv(f"{prefix}_MAX_ROWS", "1000")),
         )
 
     def validate(self) -> None:
@@ -46,6 +48,8 @@ class ServerConfig:
     disabled_tools: List[str] = field(default_factory=list)
     disabled_categories: List[str] = field(default_factory=list)
     read_only: bool = False
+    transport: str = "stdio"
+    auth_token: str = ""
 
     @classmethod
     def from_env(cls) -> "ServerConfig":
@@ -65,6 +69,8 @@ class ServerConfig:
             disabled_tools=disabled_tools,
             disabled_categories=disabled_categories,
             read_only=os.getenv("VELOCIRAPTOR_READ_ONLY", "false").lower() in {"1", "true", "yes"},
+            transport=os.getenv("MCP_TRANSPORT", "stdio").lower(),
+            auth_token=os.getenv("MCP_AUTH_TOKEN", ""),
         )
 
 

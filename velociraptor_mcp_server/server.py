@@ -3,12 +3,17 @@ Main MCP server implementation.
 """
 
 import asyncio
+import hmac
 import json
 import logging
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
+import uvicorn
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
+from starlette.middleware import Middleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from .client import VelociraptorClient
 from .config import Config
@@ -98,6 +103,52 @@ class CollectArtifactDetailsArgs(BaseModel):
     )
 
 
+# Tool name -> (category, writes). `writes` marks tools that act on endpoints or can run arbitrary VQL;
+# they are not registered when VELOCIRAPTOR_READ_ONLY is true. Unclassified tools count as writes.
+TOOL_META: Dict[str, Tuple[str, bool]] = {
+    "AuthenticateTool": ("auth", False),
+    "GetAgentInfo": ("clients", False),
+    "RunVQLQueryTool": ("vql", True),
+    "ListLinuxArtifactNamesTool": ("artifacts", False),
+    "ListWindowsArtifactNamesTool": ("artifacts", False),
+    "ListLinuxArtifactsTool": ("artifacts", False),
+    "ListWindowsArtifactsTool": ("artifacts", False),
+    "FindArtifactDetailsTool": ("artifacts", False),
+    "CollectArtifactDetailsTool": ("artifacts", False),
+    "CollectArtifactTool": ("collections", True),
+    "GetCollectionResultsTool": ("collections", False),
+}
+
+
+class BearerAuthMiddleware:
+    """Require `Authorization: Bearer <MCP_AUTH_TOKEN>` on every HTTP path except /healthz."""
+
+    def __init__(self, app, token: str) -> None:
+        self.app = app
+        self.token = token.encode()
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or scope.get("path") == "/healthz":
+            await self.app(scope, receive, send)
+            return
+        header = dict(scope.get("headers") or []).get(b"authorization", b"")
+        scheme, _, presented = header.partition(b" ")
+        if scheme.lower() != b"bearer" or not hmac.compare_digest(presented.strip(), self.token):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"www-authenticate", b"Bearer"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": b'{"error":"Unauthorized"}'})
+            return
+        await self.app(scope, receive, send)
+
+
 class VelociraptorMCPServer:
     """Main MCP server for Velociraptor integration."""
 
@@ -109,6 +160,22 @@ class VelociraptorMCPServer:
         # Register tools
         self._register_tools()
 
+        @self.app.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+        async def healthz(_request: Request) -> JSONResponse:
+            return JSONResponse({"status": "ok"})
+
+    def _enabled(self, name: str) -> bool:
+        """Whether a tool should be registered, given disabled tools, categories and read-only mode."""
+        category, writes = TOOL_META.get(name, ("other", True))
+        server = self.config.server
+        if name in server.disabled_tools or category in server.disabled_categories:
+            logger.info("Tool %s disabled by configuration", name)
+            return False
+        if server.read_only and writes:
+            logger.info("Tool %s not registered: VELOCIRAPTOR_READ_ONLY is set", name)
+            return False
+        return True
+
     def _get_client(self) -> VelociraptorClient:
         """Get or create Velociraptor client."""
         if self._client is None:
@@ -118,7 +185,7 @@ class VelociraptorMCPServer:
     def _register_tools(self) -> None:
         """Register all available tools."""
 
-        if "AuthenticateTool" not in self.config.server.disabled_tools:
+        if self._enabled("AuthenticateTool"):
 
             @self.app.tool(
                 name="AuthenticateTool",
@@ -147,7 +214,7 @@ class VelociraptorMCPServer:
                     logger.error("Authentication failed: %s", e)
                     return [{"type": "text", "text": f"Authentication failed: {str(e)}"}]
 
-        if "GetAgentInfo" not in self.config.server.disabled_tools:
+        if self._enabled("GetAgentInfo"):
 
             @self.app.tool(
                 name="GetAgentInfo",
@@ -179,7 +246,7 @@ class VelociraptorMCPServer:
                         await client.authenticate()
 
                     # Use the find_client_info method from the client
-                    client_info = client.find_client_info(args.hostname)
+                    client_info = await asyncio.to_thread(client.find_client_info, args.hostname)
 
                     if client_info is None:
                         return [
@@ -202,7 +269,7 @@ class VelociraptorMCPServer:
                     logger.error("Failed to get agent info: %s", e)
                     return [{"type": "text", "text": f"Error getting agent info: {str(e)}"}]
 
-        if "RunVQLQueryTool" not in self.config.server.disabled_tools:
+        if self._enabled("RunVQLQueryTool"):
 
             @self.app.tool(
                 name="RunVQLQueryTool",
@@ -240,7 +307,9 @@ class VelociraptorMCPServer:
                         await client.authenticate()
 
                     # Execute the VQL query using the client's run_vql_query method
-                    results = client.run_vql_query(args.vql)
+                    results = await asyncio.to_thread(
+                        client.run_vql_query, args.vql, max_rows=args.max_rows, timeout=args.timeout
+                    )
 
                     # Format the response
                     response_text = json.dumps(results, indent=2)
@@ -255,7 +324,7 @@ class VelociraptorMCPServer:
                     logger.error("Failed to execute VQL query: %s", e)
                     return [{"type": "text", "text": f"Error executing VQL query: {str(e)}"}]
 
-        if "ListLinuxArtifactNamesTool" not in self.config.server.disabled_tools:
+        if self._enabled("ListLinuxArtifactNamesTool"):
 
             @self.app.tool(
                 name="ListLinuxArtifactNamesTool",
@@ -268,7 +337,7 @@ class VelociraptorMCPServer:
                     if client.stub is None:
                         await client.authenticate()
                     vql = "SELECT name FROM artifact_definitions() WHERE type =~ 'client' AND name =~ 'linux\\.'"
-                    results = client.run_vql_query(vql)
+                    results = await asyncio.to_thread(client.run_vql_query, vql)
                     names = [r["name"] for r in results if "name" in r]
                     response_text = json.dumps(names, indent=2)
                     return [{"type": "text", "text": self._safe_truncate(response_text)}]
@@ -278,7 +347,7 @@ class VelociraptorMCPServer:
                         {"type": "text", "text": f"Error listing Linux artifact names: {str(e)}"},
                     ]
 
-        if "ListWindowsArtifactNamesTool" not in self.config.server.disabled_tools:
+        if self._enabled("ListWindowsArtifactNamesTool"):
 
             @self.app.tool(
                 name="ListWindowsArtifactNamesTool",
@@ -291,7 +360,7 @@ class VelociraptorMCPServer:
                     if client.stub is None:
                         await client.authenticate()
                     vql = "SELECT name FROM artifact_definitions() WHERE type =~ 'client' AND name =~ '^windows\\.'"
-                    results = client.run_vql_query(vql)
+                    results = await asyncio.to_thread(client.run_vql_query, vql)
                     names = [r["name"] for r in results if "name" in r]
                     response_text = json.dumps(names, indent=2)
                     return [{"type": "text", "text": self._safe_truncate(response_text)}]
@@ -301,7 +370,7 @@ class VelociraptorMCPServer:
                         {"type": "text", "text": f"Error listing Windows artifact names: {str(e)}"},
                     ]
 
-        if "ListLinuxArtifactsTool" not in self.config.server.disabled_tools:
+        if self._enabled("ListLinuxArtifactsTool"):
 
             @self.app.tool(
                 name="ListLinuxArtifactsTool",
@@ -337,7 +406,7 @@ class VelociraptorMCPServer:
                         return desc.strip().split(".")[0][:120].rstrip() + "..." if desc else ""
 
                     # Execute the VQL query
-                    results = client.run_vql_query(vql)
+                    results = await asyncio.to_thread(client.run_vql_query, vql)
 
                     # Process results to create summaries
                     summaries = []
@@ -363,7 +432,7 @@ class VelociraptorMCPServer:
                     logger.error("Failed to list Linux artifacts: %s", e)
                     return [{"type": "text", "text": f"Error listing Linux artifacts: {str(e)}"}]
 
-        if "ListWindowsArtifactsTool" not in self.config.server.disabled_tools:
+        if self._enabled("ListWindowsArtifactsTool"):
 
             @self.app.tool(
                 name="ListWindowsArtifactsTool",
@@ -403,7 +472,7 @@ class VelociraptorMCPServer:
                         return desc.strip().split(".")[0][:120].rstrip() + "..." if desc else ""
 
                     # Execute the VQL query
-                    results = client.run_vql_query(vql)
+                    results = await asyncio.to_thread(client.run_vql_query, vql)
 
                     # Process results to create summaries
                     summaries = []
@@ -429,7 +498,7 @@ class VelociraptorMCPServer:
                     logger.error("Failed to list Windows artifacts: %s", e)
                     return [{"type": "text", "text": f"Error listing Windows artifacts: {str(e)}"}]
 
-        if "FindArtifactDetailsTool" not in self.config.server.disabled_tools:
+        if self._enabled("FindArtifactDetailsTool"):
 
             @self.app.tool(
                 name="FindArtifactDetailsTool",
@@ -449,13 +518,15 @@ class VelociraptorMCPServer:
                     client = self._get_client()
                     if client.stub is None:
                         await client.authenticate()
-                    vql = f"""
+                    vql = """
                     LET params(data) = SELECT name, description, type, default FROM data
                     SELECT name, description, params(data=parameters) AS parameters
                     FROM artifact_definitions()
-                    WHERE name = '{args.artifact_name}'
+                    WHERE name = McpArtifactName
                     """
-                    results = client.run_vql_query(vql)
+                    results = await asyncio.to_thread(
+                        client.run_vql_query, vql, env={"McpArtifactName": args.artifact_name}
+                    )
                     if not results:
                         return [
                             {
@@ -485,7 +556,7 @@ class VelociraptorMCPServer:
                     logger.error("Failed to find artifact details: %s", e)
                     return [{"type": "text", "text": f"Error finding artifact details: {str(e)}"}]
 
-        if "CollectArtifactTool" not in self.config.server.disabled_tools:
+        if self._enabled("CollectArtifactTool"):
 
             @self.app.tool(
                 name="CollectArtifactTool",
@@ -519,7 +590,7 @@ class VelociraptorMCPServer:
                         await client.authenticate()
 
                     # Start the collection using the client's start_collection method
-                    response = client.start_collection(
+                    response = await asyncio.to_thread(client.start_collection, 
                         args.client_id,
                         args.artifact,
                         args.parameters,
@@ -551,7 +622,7 @@ class VelociraptorMCPServer:
                     logger.error("Failed to collect artifact: %s", e)
                     return [{"type": "text", "text": f"Error collecting artifact: {str(e)}"}]
 
-        if "GetCollectionResultsTool" not in self.config.server.disabled_tools:
+        if self._enabled("GetCollectionResultsTool"):
 
             @self.app.tool(
                 name="GetCollectionResultsTool",
@@ -588,8 +659,10 @@ class VelociraptorMCPServer:
                         await client.authenticate()
 
                     # First, get artifact details to check if it has multiple sources
-                    artifact_details_vql = f"SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = '{args.artifact}'"
-                    artifact_details = client.run_vql_query(artifact_details_vql)
+                    artifact_details_vql = "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = McpArtifactName"
+                    artifact_details = await asyncio.to_thread(
+                        client.run_vql_query, artifact_details_vql, env={"McpArtifactName": args.artifact}
+                    )
 
                     source_names = []
                     if artifact_details and len(artifact_details) > 0:
@@ -630,7 +703,7 @@ class VelociraptorMCPServer:
                             if (
                                 artifact_with_source not in all_results
                             ):  # Only check if we haven't gotten results yet
-                                status = client.get_flow_status(
+                                status = await asyncio.to_thread(client.get_flow_status, 
                                     args.client_id,
                                     args.flow_id,
                                     artifact_with_source,
@@ -639,7 +712,7 @@ class VelociraptorMCPServer:
 
                                 if status == "FINISHED":
                                     # Get the results for this artifact/source
-                                    results = client.get_flow_results(
+                                    results = await asyncio.to_thread(client.get_flow_results, 
                                         args.client_id,
                                         args.flow_id,
                                         artifact_with_source,
@@ -709,7 +782,7 @@ class VelociraptorMCPServer:
                     logger.error("Failed to get collection results: %s", e)
                     return [{"type": "text", "text": f"Error getting collection results: {str(e)}"}]
 
-        if "CollectArtifactDetailsTool" not in self.config.server.disabled_tools:
+        if self._enabled("CollectArtifactDetailsTool"):
 
             @self.app.tool(
                 name="CollectArtifactDetailsTool",
@@ -747,8 +820,10 @@ class VelociraptorMCPServer:
                         await client.authenticate()
 
                     # Execute the VQL query to get artifact details
-                    vql = f"SELECT name,description,parameters,sources.name as source_names FROM artifact_definitions() WHERE name = '{args.artifact_name}'"
-                    results = client.run_vql_query(vql)
+                    vql = "SELECT name,description,parameters,sources.name as source_names FROM artifact_definitions() WHERE name = McpArtifactName"
+                    results = await asyncio.to_thread(
+                        client.run_vql_query, vql, env={"McpArtifactName": args.artifact_name}
+                    )
 
                     if not results:
                         return [
@@ -880,12 +955,29 @@ class VelociraptorMCPServer:
             # Fallback to empty model
             return model_class()
 
+    def http_app(self):
+        """Streamable HTTP app at /mcp with bearer-token auth and an open /healthz."""
+        token = self.config.server.auth_token
+        if not token:
+            raise ValueError("MCP_AUTH_TOKEN is required for the HTTP transport")
+        return self.app.http_app(
+            path="/mcp", middleware=[Middleware(BearerAuthMiddleware, token=token)]
+        )
+
     def start(self, host: str = None, port: int = None) -> None:
-        """Start the MCP server using stdio transport."""
-        logger.info("Starting Velociraptor MCP Server (stdio transport)")
+        """Start the MCP server on the configured transport (stdio by default)."""
+        server = self.config.server
         logger.info("SSL Verify: %s", self.config.velociraptor.ssl_verify)
 
-        # stdio transport is required when the server is invoked via MCP command in .mcp.json
+        if server.transport == "http":
+            host = host or server.host
+            port = port or server.port
+            logger.info("Starting Velociraptor MCP Server (HTTP transport) on %s:%s/mcp", host, port)
+            uvicorn.run(self.http_app(), host=host, port=port, log_level=server.log_level.lower())
+            return
+
+        # stdio is what MCP clients use when they launch the server as a subprocess (.mcp.json).
+        logger.info("Starting Velociraptor MCP Server (stdio transport)")
         self.app.run()
 
     async def close(self) -> None:
