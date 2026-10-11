@@ -5,7 +5,8 @@ Velociraptor client for API communication.
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Mapping, Optional
 
 import grpc
 import yaml
@@ -15,6 +16,36 @@ from .config import VelociraptorConfig
 from .exceptions import VelociraptorAPIError, VelociraptorAuthenticationError
 
 logger = logging.getLogger(__name__)
+
+# Untrusted values never go into VQL text. They are passed as query environment variables
+# (VQLCollectorArgs.env) and referenced by name, so a crafted hostname, artifact or field can't change
+# the query. Variable names carry an `Mcp` prefix so they never collide with column names or aliases
+# (a variable called `Hostname` would be shadowed by `... AS Hostname`). Identifiers that must appear in the text (field lists) are validated instead.
+_CLIENT_ID = re.compile(r"^(C\.[0-9a-fA-F]+|server)$")
+_FLOW_ID = re.compile(r"^F\.[A-Za-z0-9]+(\.[A-Za-z0-9]+)?$")  # hunt flows end in ".H"
+_ARTIFACT = re.compile(r"^[A-Za-z0-9_.\-]+(/[A-Za-z0-9_.\- ]+)?$")
+_FIELDS = re.compile(r"^\s*(\*|[A-Za-z_][\w.]*(\s*,\s*[A-Za-z_][\w.]*)*)\s*$")
+_PARAM = re.compile(r"\s*([A-Za-z_]\w*)\s*=\s*'([^']*)'\s*(?:,|$)")
+
+
+def _check(value: str, pattern: "re.Pattern[str]", what: str) -> str:
+    if not isinstance(value, str) or not pattern.match(value):
+        raise ValueError(f"invalid {what}: {value!r}")
+    return value
+
+
+def parse_parameters(parameters: str) -> Dict[str, str]:
+    """Parse the tools' "key='value', key2='value2'" parameter string into a dict, strictly."""
+    result: Dict[str, str] = {}
+    text = (parameters or "").strip()
+    pos = 0
+    while pos < len(text):
+        match = _PARAM.match(text, pos)
+        if not match or match.end() == pos:
+            raise ValueError(f"invalid artifact parameters near: {text[pos:pos + 40]!r}")
+        result[match.group(1)] = match.group(2)
+        pos = match.end()
+    return result
 
 
 class VelociraptorClient:
@@ -124,14 +155,23 @@ class VelociraptorClient:
                 raise
             raise VelociraptorAuthenticationError(f"Authentication failed: {e}")
 
-    def run_vql_query(self, vql: str) -> List[Dict[str, Any]]:
+    def run_vql_query(
+        self,
+        vql: str,
+        env: Optional[Mapping[str, str]] = None,
+        max_rows: Optional[int] = None,
+        timeout: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """Execute a VQL query on the Velociraptor server.
 
         Args:
             vql: VQL query string to execute
+            env: Query variables, referenced by name in `vql` (used for every untrusted value)
+            max_rows: Row cap; never more than the configured `max_rows`
+            timeout: Query timeout in seconds; never more than the configured `timeout`
 
         Returns:
-            List of result dictionaries
+            List of result dictionaries (at most the row cap)
 
         Raises:
             VelociraptorAPIError: If query execution fails
@@ -140,22 +180,41 @@ class VelociraptorClient:
         if self.stub is None:
             raise RuntimeError("Stub not initialized. Call authenticate() first.")
 
+        cap = self.config.max_rows
+        if max_rows is not None and max_rows > 0:
+            cap = min(cap, max_rows)
+        deadline = self.config.timeout
+        if timeout is not None and timeout > 0:
+            deadline = min(deadline, timeout)
+
         try:
             logger.info("Executing VQL query: %s", vql)
-            request = api_pb2.VQLCollectorArgs(Query=[api_pb2.VQLRequest(VQL=vql)])
-            results = []
-
-            for resp in self.stub.Query(request):
+            request = api_pb2.VQLCollectorArgs(
+                Query=[api_pb2.VQLRequest(VQL=vql)],
+                env=[api_pb2.VQLEnv(key=k, value=str(v)) for k, v in (env or {}).items()],
+                max_row=cap,
+                timeout=deadline,
+            )
+            results: List[Dict[str, Any]] = []
+            stream = self.stub.Query(request, timeout=deadline + 5)
+            for resp in stream:
                 if hasattr(resp, "error") and resp.error:
                     raise VelociraptorAPIError(f"Velociraptor API error: {resp.error}")
                 if hasattr(resp, "Response") and resp.Response:
                     results.extend(json.loads(resp.Response))
+                if len(results) >= cap:
+                    # Stop reading; cancel the server-side query when the stream supports it.
+                    if hasattr(stream, "cancel"):
+                        stream.cancel()
+                    break
 
-            return results
+            return results[:cap]
 
         except grpc.RpcError as e:
             logger.error("gRPC error during query execution: %s", e)
             raise VelociraptorAPIError(f"Query execution failed: {e}")
+        except VelociraptorAPIError:
+            raise
         except Exception as e:
             logger.error("Query execution failed: %s", e)
             raise VelociraptorAPIError(f"Query execution failed: {e}")
@@ -170,16 +229,9 @@ class VelociraptorClient:
     # Helper methods based on the provided examples
 
     def find_client_info(self, hostname: str) -> Optional[Dict[str, Any]]:
-        """Find client information by hostname.
-
-        Args:
-            hostname: Hostname to search for
-
-        Returns:
-            Client information dictionary or None if not found
-        """
+        """Find client information by hostname or FQDN (exact, case-sensitive match)."""
         vql = (
-            f"SELECT client_id,"
+            "SELECT client_id,"
             "timestamp(epoch=first_seen_at) as FirstSeen,"
             "timestamp(epoch=last_seen_at) as LastSeen,"
             "os_info.hostname as Hostname,"
@@ -188,10 +240,11 @@ class VelociraptorClient:
             "os_info.release as OS,"
             "os_info.machine as Machine,"
             "agent_information.version as AgentVersion "
-            f"FROM clients() WHERE os_info.hostname =~ '^{hostname}$' OR os_info.fqdn =~ '^{hostname}$' ORDER BY LastSeen DESC LIMIT 1"
+            "FROM clients() WHERE os_info.hostname = McpHostname OR os_info.fqdn = McpHostname "
+            "ORDER BY LastSeen DESC LIMIT 1"
         )
 
-        result = self.run_vql_query(vql)
+        result = self.run_vql_query(vql, env={"McpHostname": hostname})
         if not result:
             return None
         return result[0]
@@ -207,37 +260,39 @@ class VelociraptorClient:
         Args:
             client_id: Target client ID
             artifact: Artifact to collect
-            parameters: Collection parameters
+            parameters: "key='value', ..." pairs passed to the artifact
 
         Returns:
             Collection information
         """
         vql = (
-            f"LET collection <= collect_client(urgent='TRUE',client_id='{client_id}', artifacts='{artifact}', env=dict({parameters})) "
-            f"SELECT flow_id,request.artifacts as artifacts,request.specs[0] as specs FROM foreach(row= collection)"
+            "LET collection <= collect_client(urgent='TRUE', client_id=McpClientId, "
+            "artifacts=McpArtifact, env=parse_json(data=McpParams)) "
+            "SELECT flow_id,request.artifacts as artifacts,request.specs[0] as specs "
+            "FROM foreach(row=collection)"
         )
-
-        return self.run_vql_query(vql)
+        env = {
+            "McpClientId": _check(client_id, _CLIENT_ID, "client_id"),
+            "McpArtifact": _check(artifact, _ARTIFACT, "artifact"),
+            "McpParams": json.dumps(parse_parameters(parameters)),
+        }
+        return self.run_vql_query(vql, env=env)
 
     def get_flow_status(self, client_id: str, flow_id: str, artifact: str) -> str:
-        """Get the status of a flow.
-
-        Args:
-            client_id: Target client ID
-            flow_id: Flow ID to check
-            artifact: Artifact name
-
-        Returns:
-            Status string: "FINISHED" or "RUNNING"
-        """
+        """Get the status of a flow: "FINISHED", "RUNNING" or "ERROR"."""
         vql = (
-            f"SELECT * FROM flow_logs(client_id='{client_id}', flow_id='{flow_id}') "
-            f"WHERE message =~ '^Collection {artifact} is done after' "
-            f"LIMIT 100"
+            "SELECT * FROM flow_logs(client_id=McpClientId, flow_id=McpFlowId) "
+            "WHERE message =~ McpDonePattern LIMIT 100"
         )
 
         try:
-            results = self.run_vql_query(vql)
+            env = {
+                "McpClientId": _check(client_id, _CLIENT_ID, "client_id"),
+                "McpFlowId": _check(flow_id, _FLOW_ID, "flow_id"),
+                "McpDonePattern": "^Collection " + re.escape(_check(artifact, _ARTIFACT, "artifact"))
+                + " is done after",
+            }
+            results = self.run_vql_query(vql, env=env)
             logger.info("Flow status query results: %s", results)
             if results and isinstance(results, list) and len(results) > 0:
                 return "FINISHED"
@@ -252,20 +307,19 @@ class VelociraptorClient:
         flow_id: str,
         artifact: str,
         fields: str = "*",
+        max_rows: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Get results from a completed flow.
-
-        Args:
-            client_id: Target client ID
-            flow_id: Flow ID to get results from
-            artifact: Artifact name
-            fields: Fields to select
-
-        Returns:
-            Flow results
-        """
-        vql = f"SELECT {fields} FROM source(client_id='{client_id}', flow_id='{flow_id}',artifact='{artifact}')"
-        return self.run_vql_query(vql)
+        """Get results from a completed flow (at most the configured row cap)."""
+        vql = (
+            f"SELECT {_check(fields, _FIELDS, 'fields').strip()} "
+            "FROM source(client_id=McpClientId, flow_id=McpFlowId, artifact=McpArtifact)"
+        )
+        env = {
+            "McpClientId": _check(client_id, _CLIENT_ID, "client_id"),
+            "McpFlowId": _check(flow_id, _FLOW_ID, "flow_id"),
+            "McpArtifact": _check(artifact, _ARTIFACT, "artifact"),
+        }
+        return self.run_vql_query(vql, env=env, max_rows=max_rows)
 
     def realtime_collection(
         self,
@@ -275,26 +329,25 @@ class VelociraptorClient:
         fields: str = "*",
         result_scope: str = "",
     ) -> List[Dict[str, Any]]:
-        """Perform a realtime collection and wait for results.
-
-        Args:
-            client_id: Target client ID
-            artifact: Artifact to collect
-            parameters: Collection parameters
-            fields: Fields to select from results
-            result_scope: Additional scope for results
-
-        Returns:
-            Collection results
-        """
+        """Perform a realtime collection and wait for results."""
+        source = artifact + result_scope
         vql = (
-            f"LET collection <= collect_client(urgent='TRUE',client_id='{client_id}', artifacts='{artifact}', env=dict({parameters})) "
-            f"LET get_monitoring = SELECT * FROM watch_monitoring(artifact='System.Flow.Completion') WHERE FlowId = collection.flow_id LIMIT 1 "
-            f"LET get_results = SELECT * FROM source(client_id=collection.request.client_id, flow_id=collection.flow_id,artifact='{artifact}{result_scope}') "
-            f"SELECT {fields} FROM foreach(row= get_monitoring ,query= get_results)"
+            "LET collection <= collect_client(urgent='TRUE', client_id=McpClientId, "
+            "artifacts=McpArtifact, env=parse_json(data=McpParams)) "
+            "LET get_monitoring = SELECT * FROM watch_monitoring(artifact='System.Flow.Completion') "
+            "WHERE FlowId = collection.flow_id LIMIT 1 "
+            "LET get_results = SELECT * FROM source(client_id=collection.request.client_id, "
+            "flow_id=collection.flow_id, artifact=McpSource) "
+            f"SELECT {_check(fields, _FIELDS, 'fields').strip()} "
+            "FROM foreach(row=get_monitoring, query=get_results)"
         )
-
-        return self.run_vql_query(vql)
+        env = {
+            "McpClientId": _check(client_id, _CLIENT_ID, "client_id"),
+            "McpArtifact": _check(artifact, _ARTIFACT, "artifact"),
+            "McpSource": _check(source, _ARTIFACT, "artifact source"),
+            "McpParams": json.dumps(parse_parameters(parameters)),
+        }
+        return self.run_vql_query(vql, env=env)
 
     def __del__(self):
         """Cleanup when object is destroyed."""

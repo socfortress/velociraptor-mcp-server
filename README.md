@@ -97,11 +97,27 @@ velociraptor-mcp-server
 # Or using the Python module
 python -m velociraptor_mcp_server
 
-# With custom configuration
-velociraptor-mcp-server --host 0.0.0.0 --port 8080 --log-level DEBUG
+# Streamable HTTP for networked clients (requires MCP_AUTH_TOKEN)
+MCP_AUTH_TOKEN=$(openssl rand -hex 32) velociraptor-mcp-server --transport http --host 0.0.0.0 --port 8000
 ```
 
-The server will start and be available at `http://127.0.0.1:8000` (or your configured host/port).
+By default the server speaks MCP over **stdio**, for clients that launch it as a subprocess (`.mcp.json`).
+With `--transport http` (or `MCP_TRANSPORT=http`) it serves streamable HTTP at `http://<host>:<port>/mcp`:
+
+- Every request must carry `Authorization: Bearer <MCP_AUTH_TOKEN>`. The server refuses to start in HTTP mode without a token.
+- `GET /healthz` is unauthenticated, for container health checks.
+
+For an AI analyst that should only read existing results, set `VELOCIRAPTOR_READ_ONLY=true`. `RunVQLQueryTool` (arbitrary VQL) and `CollectArtifactTool` are then not registered.
+
+Example from Pydantic AI:
+
+```python
+from pydantic_ai.mcp import MCPToolset
+
+velo = MCPToolset("http://velociraptor-mcp:8000/mcp", id="velociraptor", headers={"Authorization": f"Bearer {token}"})
+async with velo:
+    info = await velo.direct_call_tool("GetAgentInfo", {"args": {"hostname": "workstation-01"}})
+```
 
 ---
 
@@ -141,11 +157,18 @@ pre-commit install
 |----------|-------------|---------|----------|
 | `VELOCIRAPTOR_API_KEY` | Path to Velociraptor API config file (api.config.yaml) | None | ✅ |
 | `VELOCIRAPTOR_SSL_VERIFY` | SSL verification | `true` | ❌ |
-| `VELOCIRAPTOR_TIMEOUT` | Request timeout (seconds) | `30` | ❌ |
-| `MCP_SERVER_HOST` | Server host | `127.0.0.1` | ❌ |
-| `MCP_SERVER_PORT` | Server port | `8000` | ❌ |
+| `VELOCIRAPTOR_TIMEOUT` | Query timeout (seconds); the upper bound for any query, including `RunVQLQueryTool`'s `timeout` | `30` | ❌ |
+| `VELOCIRAPTOR_MAX_ROWS` | Row cap for any query, including `RunVQLQueryTool`'s `max_rows` | `1000` | ❌ |
+| `VELOCIRAPTOR_READ_ONLY` | Don't register `RunVQLQueryTool` or `CollectArtifactTool`. Unclassified tools count as writes. | `false` | ❌ |
+| `VELOCIRAPTOR_DISABLED_CATEGORIES` | Comma-separated categories: `auth`, `clients`, `vql`, `artifacts`, `collections` | None | ❌ |
+| `MCP_TRANSPORT` | `stdio` or `http` | `stdio` | ❌ |
+| `MCP_SERVER_HOST` | HTTP bind host | `127.0.0.1` | ❌ |
+| `MCP_SERVER_PORT` | HTTP port | `8000` | ❌ |
+| `MCP_AUTH_TOKEN` | Bearer token for the HTTP transport | None | ✅ for `http` |
 | `LOG_LEVEL` | Logging level | `INFO` | ❌ |
 | `VELOCIRAPTOR_DISABLED_TOOLS` | Comma-separated list of disabled tools | None | ❌ |
+
+Untrusted values (hostnames, client and flow IDs, artifact names, collection parameters) are passed to Velociraptor as query variables, never spliced into VQL text. Field lists are validated as identifiers.
 
 ### CLI Options
 
@@ -154,10 +177,11 @@ velociraptor-mcp-server --help
 ```
 
 Available options:
-- `--host`: Host to bind server to (default: 127.0.0.1)
-- `--port`: Port to bind server to (default: 8000)
+- `--transport`: `stdio` or `http` (default: `MCP_TRANSPORT`, else stdio)
+- `--host`: HTTP bind host (default: `MCP_SERVER_HOST`, else 127.0.0.1)
+- `--port`: HTTP port (default: `MCP_SERVER_PORT`, else 8000)
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-- `--config`: Path to Velociraptor API config file (overrides env var)
+- `--api-config`: Path to Velociraptor API config file (overrides env var)
 - `--no-ssl-verify`: Disable SSL certificate verification
 
 ---

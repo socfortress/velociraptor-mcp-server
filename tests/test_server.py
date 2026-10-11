@@ -305,7 +305,9 @@ class TestVelociraptorMCPServer:
         result_data = json.loads(outer_data[0]["text"])
         assert len(result_data) == 2
         assert result_data[0]["client_id"] == "C.1234567890"
-        mock_client.run_vql_query.assert_called_once_with("SELECT * FROM clients() LIMIT 10")
+        mock_client.run_vql_query.assert_called_once_with(
+            "SELECT * FROM clients() LIMIT 10", max_rows=None, timeout=None
+        )
 
     @pytest.mark.asyncio
     async def test_list_linux_artifacts_tool_execution(self, config):
@@ -600,7 +602,8 @@ class TestVelociraptorMCPServer:
 
         # Verify the methods were called correctly
         mock_client.run_vql_query.assert_called_once_with(
-            "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = 'Windows.System.Users'",
+            "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = McpArtifactName",
+            env={"McpArtifactName": "Windows.System.Users"},
         )
         mock_client.get_flow_status.assert_called_once_with(
             "C.1234567890",
@@ -666,7 +669,8 @@ class TestVelociraptorMCPServer:
 
         # Verify the methods were called correctly
         mock_client.run_vql_query.assert_called_once_with(
-            "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = 'Windows.System.Users'",
+            "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = McpArtifactName",
+            env={"McpArtifactName": "Windows.System.Users"},
         )
         # Verify the status was checked multiple times
         assert mock_client.get_flow_status.call_count == 2
@@ -743,7 +747,8 @@ class TestVelociraptorMCPServer:
 
         # Verify the methods were called correctly
         mock_client.run_vql_query.assert_called_once_with(
-            "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = 'Linux.Debian.Packages'",
+            "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = McpArtifactName",
+            env={"McpArtifactName": "Linux.Debian.Packages"},
         )
 
         # Verify get_flow_status was called for both sources
@@ -841,7 +846,8 @@ class TestVelociraptorMCPServer:
 
         # Verify the methods were called correctly - should use artifact name directly without slash
         mock_client.run_vql_query.assert_called_once_with(
-            "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = 'Linux.Sys.Users'",
+            "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = McpArtifactName",
+            env={"McpArtifactName": "Linux.Sys.Users"},
         )
         mock_client.get_flow_status.assert_called_once_with(
             "C.1234567890",
@@ -931,7 +937,8 @@ class TestVelociraptorMCPServer:
 
         # Verify the VQL query was called with correct parameters
         mock_client.run_vql_query.assert_called_once_with(
-            "SELECT name,description,parameters,sources.name as source_names FROM artifact_definitions() WHERE name = 'Windows.System.Users'",
+            "SELECT name,description,parameters,sources.name as source_names FROM artifact_definitions() WHERE name = McpArtifactName",
+            env={"McpArtifactName": "Windows.System.Users"},
         )
 
     @pytest.mark.asyncio
@@ -965,7 +972,8 @@ class TestVelociraptorMCPServer:
 
         # Verify the VQL query was called
         mock_client.run_vql_query.assert_called_once_with(
-            "SELECT name,description,parameters,sources.name as source_names FROM artifact_definitions() WHERE name = 'NonExistent.Artifact'",
+            "SELECT name,description,parameters,sources.name as source_names FROM artifact_definitions() WHERE name = McpArtifactName",
+            env={"McpArtifactName": "NonExistent.Artifact"},
         )
 
     @pytest.mark.asyncio
@@ -1045,7 +1053,8 @@ class TestVelociraptorMCPServer:
 
         # Verify the methods were called correctly
         mock_client.run_vql_query.assert_called_once_with(
-            "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = 'Linux.Debian.Packages'",
+            "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = McpArtifactName",
+            env={"McpArtifactName": "Linux.Debian.Packages"},
         )
 
         # Verify get_flow_status was called for both sources
