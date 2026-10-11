@@ -29,9 +29,27 @@ class AuthenticateArgs(BaseModel):
 
 
 class GetAgentInfoArgs(BaseModel):
-    """Arguments for getting agent information by hostname."""
+    """Arguments for getting agent information by hostname/FQDN or client ID (give one)."""
 
-    hostname: str = Field(..., description="Hostname or FQDN of the client to search for")
+    hostname: Optional[str] = Field(None, description="Hostname or FQDN of the client to search for")
+    client_id: Optional[str] = Field(None, description="Velociraptor client ID, e.g. C.1234abcd")
+
+
+class GetHuntResultsArgs(BaseModel):
+    """Arguments for reading existing hunt results."""
+
+    hunt_id: str = Field(..., description="Hunt ID, e.g. H.D8CNRTTL5AOMM")
+    artifact: str = Field(
+        ..., description="Artifact name, optionally with a source (e.g. Windows.System.Pslist or Artifact/Source)"
+    )
+    fields: str = Field("*", description="Comma-separated fields to return (default '*')")
+    limit: Optional[int] = Field(None, description="Maximum rows to return (capped by VELOCIRAPTOR_MAX_ROWS)")
+
+
+class ListHuntsArgs(BaseModel):
+    """Arguments for listing hunts."""
+
+    limit: Optional[int] = Field(20, description="Maximum hunts to return, newest first")
 
 
 class RunVQLQueryArgs(BaseModel):
@@ -92,6 +110,14 @@ class GetCollectionResultsArgs(BaseModel):
     )
     max_retries: int = Field(5, description="Number of times to retry if the flow hasn't finished")
     retry_delay: int = Field(5, description="Time in seconds to wait between retries")
+    wait: bool = Field(
+        True,
+        description="Wait and retry until the flow finishes. False returns the current state at once "
+        "(use for existing collections).",
+    )
+    limit: Optional[int] = Field(
+        None, description="Maximum rows per artifact source (capped by VELOCIRAPTOR_MAX_ROWS)"
+    )
 
 
 class CollectArtifactDetailsArgs(BaseModel):
@@ -117,6 +143,8 @@ TOOL_META: Dict[str, Tuple[str, bool]] = {
     "CollectArtifactDetailsTool": ("artifacts", False),
     "CollectArtifactTool": ("collections", True),
     "GetCollectionResultsTool": ("collections", False),
+    "ListHuntsTool": ("hunts", False),
+    "GetHuntResultsTool": ("hunts", False),
 }
 
 
@@ -246,13 +274,22 @@ class VelociraptorMCPServer:
                         await client.authenticate()
 
                     # Use the find_client_info method from the client
-                    client_info = await asyncio.to_thread(client.find_client_info, args.hostname)
+                    if bool(args.hostname) == bool(args.client_id):
+                        return [
+                            {"type": "text", "text": "Provide exactly one of 'hostname' or 'client_id'."},
+                        ]
+                    if args.client_id:
+                        label, kind = args.client_id, "client_id"
+                        client_info = await asyncio.to_thread(client.find_client_by_id, args.client_id)
+                    else:
+                        label, kind = args.hostname, "hostname"
+                        client_info = await asyncio.to_thread(client.find_client_info, args.hostname)
 
                     if client_info is None:
                         return [
                             {
                                 "type": "text",
-                                "text": f"No client found with hostname: {args.hostname}",
+                                "text": f"No client found with {kind}: {label}",
                             },
                         ]
 
@@ -262,7 +299,7 @@ class VelociraptorMCPServer:
                     return [
                         {
                             "type": "text",
-                            "text": f"Client information for '{args.hostname}':\n{response_text}",
+                            "text": f"Client information for '{label}':\n{response_text}",
                         },
                     ]
                 except Exception as e:
@@ -590,7 +627,8 @@ class VelociraptorMCPServer:
                         await client.authenticate()
 
                     # Start the collection using the client's start_collection method
-                    response = await asyncio.to_thread(client.start_collection, 
+                    response = await asyncio.to_thread(
+                                        client.start_collection,
                         args.client_id,
                         args.artifact,
                         args.parameters,
@@ -687,11 +725,12 @@ class VelociraptorMCPServer:
                     all_results = {}
                     incomplete_sources = []
 
-                    for attempt in range(args.max_retries):
+                    attempts = max(args.max_retries, 1) if args.wait else 1
+                    for attempt in range(attempts):
                         logger.info(
                             "Checking collection status (attempt %d/%d) for flow %s",
                             attempt + 1,
-                            args.max_retries,
+                            attempts,
                             args.flow_id,
                         )
 
@@ -703,7 +742,8 @@ class VelociraptorMCPServer:
                             if (
                                 artifact_with_source not in all_results
                             ):  # Only check if we haven't gotten results yet
-                                status = await asyncio.to_thread(client.get_flow_status, 
+                                status = await asyncio.to_thread(
+                                        client.get_flow_status,
                                     args.client_id,
                                     args.flow_id,
                                     artifact_with_source,
@@ -712,11 +752,13 @@ class VelociraptorMCPServer:
 
                                 if status == "FINISHED":
                                     # Get the results for this artifact/source
-                                    results = await asyncio.to_thread(client.get_flow_results, 
+                                    results = await asyncio.to_thread(
+                                        client.get_flow_results,
                                         args.client_id,
                                         args.flow_id,
                                         artifact_with_source,
                                         args.fields,
+                                        **({"max_rows": args.limit} if args.limit else {}),
                                     )
                                     all_results[artifact_with_source] = results
                                     logger.info(
@@ -738,7 +780,7 @@ class VelociraptorMCPServer:
                             )
 
                         # If this is the last attempt and we have some results, return partial results
-                        if attempt == args.max_retries - 1 and all_results:
+                        if attempt == attempts - 1 and all_results:
                             logger.info(
                                 "Max retries reached, returning partial results. Incomplete sources: %s",
                                 incomplete_sources,
@@ -751,7 +793,7 @@ class VelociraptorMCPServer:
                             )
 
                         # If not all finished and not the last attempt, wait before retrying
-                        if attempt < args.max_retries - 1:
+                        if attempt < attempts - 1:
                             logger.info(
                                 "Some artifacts not finished, waiting %d seconds before retry",
                                 args.retry_delay,
@@ -771,7 +813,7 @@ class VelociraptorMCPServer:
                         return [
                             {
                                 "type": "text",
-                                "text": f"Collection results not available after {args.max_retries} retries. "
+                                "text": f"Collection results not available after {attempts} retries. "
                                 f"Flow {args.flow_id} may still be running or may have failed. "
                                 f"Try again later or check the Velociraptor UI for flow status. "
                                 f"Checked artifacts: {artifacts_to_check}",
@@ -781,6 +823,51 @@ class VelociraptorMCPServer:
                 except Exception as e:
                     logger.error("Failed to get collection results: %s", e)
                     return [{"type": "text", "text": f"Error getting collection results: {str(e)}"}]
+
+        if self._enabled("ListHuntsTool"):
+
+            @self.app.tool(
+                name="ListHuntsTool",
+                description="List Velociraptor hunts, newest first, with hunt ID, state, artifacts and client counts. Read-only.",
+            )
+            async def list_hunts_tool(args: ListHuntsArgs):
+                """List hunts so their results can be read with GetHuntResultsTool."""
+                try:
+                    client = self._get_client()
+                    if client.stub is None:
+                        await client.authenticate()
+                    hunts = await asyncio.to_thread(client.list_hunts, max_rows=args.limit)
+                    return [{"type": "text", "text": self._safe_truncate(json.dumps(hunts, indent=2))}]
+                except Exception as e:
+                    logger.error("Failed to list hunts: %s", e)
+                    return [{"type": "text", "text": f"Error listing hunts: {str(e)}"}]
+
+        if self._enabled("GetHuntResultsTool"):
+
+            @self.app.tool(
+                name="GetHuntResultsTool",
+                description="Read the existing results of a Velociraptor hunt for one artifact. Artifacts with several sources must be given as Artifact/Source (see CollectArtifactDetailsTool for source names). Read-only: it runs nothing on endpoints. Use 'fields' and 'limit' to keep results small.",
+            )
+            async def get_hunt_results_tool(args: GetHuntResultsArgs):
+                """Read existing hunt results.
+
+                Example usage:
+                    {"args": {"hunt_id": "H.D8CNRTTL5AOMM", "artifact": "Windows.System.Pslist", "fields": "Name, Pid", "limit": 50}}
+                """
+                try:
+                    client = self._get_client()
+                    if client.stub is None:
+                        await client.authenticate()
+                    rows = await asyncio.to_thread(
+                        client.get_hunt_results, args.hunt_id, args.artifact, args.fields, max_rows=args.limit
+                    )
+                    header = f"Hunt {args.hunt_id} results for {args.artifact}: {len(rows)} rows"
+                    return [
+                        {"type": "text", "text": f"{header}\n{self._safe_truncate(json.dumps(rows, indent=2))}"},
+                    ]
+                except Exception as e:
+                    logger.error("Failed to get hunt results: %s", e)
+                    return [{"type": "text", "text": f"Error getting hunt results: {str(e)}"}]
 
         if self._enabled("CollectArtifactDetailsTool"):
 

@@ -60,7 +60,7 @@ def test_unclassified_tool_counts_as_write(config):
 
 def test_disabled_categories(config):
     names = tool_names(make_server(config, disabled_categories=["artifacts"]))
-    assert not any(n.startswith("List") for n in names) and "GetAgentInfo" in names
+    assert not any("Artifact" in n and n.startswith("List") for n in names) and "GetAgentInfo" in names
 
 
 # --- MCP-1/2: transport and auth --------------------------------------------------------------------
@@ -198,3 +198,72 @@ def test_hunt_flow_ids_accepted(stubbed):
     client.get_flow_results("C.abc123", "F.D2MSOOHV9UR3S.H", "Linux.Sys.Users")
     _, env = sent(grpc_stub)
     assert env["McpFlowId"] == "F.D2MSOOHV9UR3S.H"
+
+
+# --- MCP-6: client_id lookup, no-wait results, hunt results -----------------------------------------
+
+
+def test_find_client_by_id_parameterised(stubbed):
+    client, grpc_stub = stubbed
+    client.find_client_by_id("C.194759cdaf0153c8")
+    request, env = sent(grpc_stub)
+    assert "clients(client_id=McpClientId)" in request.Query[0].VQL and env == {"McpClientId": "C.194759cdaf0153c8"}
+    with pytest.raises(ValueError):
+        client.find_client_by_id("C.1') OR (1")
+
+
+def test_hunt_results_parameterised(stubbed):
+    client, grpc_stub = stubbed
+    client.get_hunt_results("H.D8CNRTTL5AOMM", "Windows.System.Pslist/Main", "Name, Pid", max_rows=5)
+    request, env = sent(grpc_stub)
+    assert "SELECT Name, Pid FROM hunt_results(hunt_id=McpHuntId" in request.Query[0].VQL
+    assert env == {"McpHuntId": "H.D8CNRTTL5AOMM", "McpArtifact": "Windows.System.Pslist/Main"}
+    assert request.max_row == 5
+    with pytest.raises(ValueError):
+        client.get_hunt_results("H.1' OR 1", "Windows.System.Pslist")
+
+
+def test_flow_status_uses_flow_state_first(velociraptor_client, mock_grpc_client):
+    """Hunt flows log a different completion message; the flow's own state is authoritative."""
+    velociraptor_client.stub = mock_grpc_client
+    mock_grpc_client.Query.return_value = [response([{"state": "FINISHED"}])]
+    assert velociraptor_client.get_flow_status("C.abc123", "F.D2MSOOHV9UR3S.H", "Linux.Sys.Users") == "FINISHED"
+    assert mock_grpc_client.Query.call_count == 1
+
+
+def _tool_server(config, **client_methods):
+    server = make_server(config)
+    mock_client = Mock()
+    mock_client.stub = Mock()
+    for name, fn in client_methods.items():
+        setattr(mock_client, name, fn)
+    server._client = mock_client
+    return server, asyncio.run(server.app.get_tools())
+
+
+def test_get_agent_info_by_client_id(config):
+    lookup = Mock(return_value={"client_id": "C.abc123", "Hostname": "h"})
+    _, tools = _tool_server(config, find_client_by_id=lookup)
+    result = asyncio.run(tools["GetAgentInfo"].run({"args": {"client_id": "C.abc123"}}))
+    assert "C.abc123" in result.content[0].text and lookup.called
+    both = asyncio.run(tools["GetAgentInfo"].run({"args": {"client_id": "C.abc123", "hostname": "h"}}))
+    assert "exactly one" in both.content[0].text
+
+
+def test_collection_results_no_wait_and_limit(config):
+    status = Mock(return_value="RUNNING")
+    results = Mock(return_value=[])
+    artifacts = Mock(return_value=[{"name": "Windows.Sys.Users", "source_names": []}])
+    _, tools = _tool_server(config, get_flow_status=status, get_flow_results=results, run_vql_query=artifacts)
+    args = {"client_id": "C.abc123", "flow_id": "F.ABC", "artifact": "Windows.Sys.Users", "wait": False}
+    out = asyncio.run(tools["GetCollectionResultsTool"].run({"args": args}))
+    assert status.call_count == 1 and "after 1 retries" in out.content[0].text  # no sleeping, one check
+
+    status.return_value = "FINISHED"
+    asyncio.run(tools["GetCollectionResultsTool"].run({"args": {**args, "limit": 7}}))
+    assert results.call_args.kwargs == {"max_rows": 7}
+
+
+def test_hunt_tools_registered_and_read_only(config):
+    names = tool_names(make_server(config, read_only=True))
+    assert {"ListHuntsTool", "GetHuntResultsTool"} <= names

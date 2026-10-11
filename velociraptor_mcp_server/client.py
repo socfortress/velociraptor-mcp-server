@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # (a variable called `Hostname` would be shadowed by `... AS Hostname`). Identifiers that must appear in the text (field lists) are validated instead.
 _CLIENT_ID = re.compile(r"^(C\.[0-9a-fA-F]+|server)$")
 _FLOW_ID = re.compile(r"^F\.[A-Za-z0-9]+(\.[A-Za-z0-9]+)?$")  # hunt flows end in ".H"
+_HUNT_ID = re.compile(r"^H\.[A-Za-z0-9]+$")
 _ARTIFACT = re.compile(r"^[A-Za-z0-9_.\-]+(/[A-Za-z0-9_.\- ]+)?$")
 _FIELDS = re.compile(r"^\s*(\*|[A-Za-z_][\w.]*(\s*,\s*[A-Za-z_][\w.]*)*)\s*$")
 _PARAM = re.compile(r"\s*([A-Za-z_]\w*)\s*=\s*'([^']*)'\s*(?:,|$)")
@@ -249,6 +250,70 @@ class VelociraptorClient:
             return None
         return result[0]
 
+    def find_client_by_id(self, client_id: str) -> Optional[Dict[str, Any]]:
+        """Find client information by client ID (e.g. C.1234abcd)."""
+        vql = (
+            "SELECT client_id,"
+            "timestamp(epoch=first_seen_at) as FirstSeen,"
+            "timestamp(epoch=last_seen_at) as LastSeen,"
+            "os_info.hostname as Hostname,"
+            "os_info.fqdn as Fqdn,"
+            "os_info.system as OSType,"
+            "os_info.release as OS,"
+            "os_info.machine as Machine,"
+            "agent_information.version as AgentVersion "
+            "FROM clients(client_id=McpClientId) LIMIT 1"
+        )
+        result = self.run_vql_query(
+            vql, env={"McpClientId": _check(client_id, _CLIENT_ID, "client_id")}
+        )
+        if not result:
+            return None
+        return result[0]
+
+    def get_flow_state(self, client_id: str, flow_id: str) -> Optional[str]:
+        """Overall flow state from flows(): FINISHED, RUNNING, ERROR, or None if the flow is unknown."""
+        rows = self.run_vql_query(
+            "SELECT state FROM flows(client_id=McpClientId, flow_id=McpFlowId)",
+            env={
+                "McpClientId": _check(client_id, _CLIENT_ID, "client_id"),
+                "McpFlowId": _check(flow_id, _FLOW_ID, "flow_id"),
+            },
+            max_rows=1,
+        )
+        return rows[0].get("state") if rows else None
+
+    def get_hunt_results(
+        self,
+        hunt_id: str,
+        artifact: str,
+        fields: str = "*",
+        max_rows: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read existing results of a hunt for one artifact (or `Artifact/Source`). Runs no new VQL on endpoints."""
+        # Multi-source artifacts need the source inside the artifact name ("Artifact/Source"); on
+        # Velociraptor 0.76 the separate `source=` argument returns no rows.
+        vql = (
+            f"SELECT {_check(fields, _FIELDS, 'fields').strip()} "
+            "FROM hunt_results(hunt_id=McpHuntId, artifact=McpArtifact)"
+        )
+        env = {
+            "McpHuntId": _check(hunt_id, _HUNT_ID, "hunt_id"),
+            "McpArtifact": _check(artifact, _ARTIFACT, "artifact"),
+        }
+        return self.run_vql_query(vql, env=env, max_rows=max_rows)
+
+    def list_hunts(self, max_rows: Optional[int] = None) -> List[Dict[str, Any]]:
+        """List hunts, newest first, with their artifacts, state and client counts."""
+        vql = (
+            "SELECT hunt_id, hunt_description AS description, state, artifacts, "
+            "timestamp(epoch=create_time) AS created, "
+            "stats.total_clients_scheduled AS clients_scheduled, "
+            "stats.total_clients_with_results AS clients_with_results "
+            "FROM hunts() ORDER BY created DESC"
+        )
+        return self.run_vql_query(vql, max_rows=max_rows)
+
     def start_collection(
         self,
         client_id: str,
@@ -286,6 +351,9 @@ class VelociraptorClient:
         )
 
         try:
+            state = self.get_flow_state(client_id, flow_id)
+            if state in ("FINISHED", "ERROR"):
+                return state
             env = {
                 "McpClientId": _check(client_id, _CLIENT_ID, "client_id"),
                 "McpFlowId": _check(flow_id, _FLOW_ID, "flow_id"),

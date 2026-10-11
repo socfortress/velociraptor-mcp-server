@@ -160,7 +160,7 @@ pre-commit install
 | `VELOCIRAPTOR_TIMEOUT` | Query timeout (seconds); the upper bound for any query, including `RunVQLQueryTool`'s `timeout` | `30` | ❌ |
 | `VELOCIRAPTOR_MAX_ROWS` | Row cap for any query, including `RunVQLQueryTool`'s `max_rows` | `1000` | ❌ |
 | `VELOCIRAPTOR_READ_ONLY` | Don't register `RunVQLQueryTool` or `CollectArtifactTool`. Unclassified tools count as writes. | `false` | ❌ |
-| `VELOCIRAPTOR_DISABLED_CATEGORIES` | Comma-separated categories: `auth`, `clients`, `vql`, `artifacts`, `collections` | None | ❌ |
+| `VELOCIRAPTOR_DISABLED_CATEGORIES` | Comma-separated categories: `auth`, `clients`, `vql`, `artifacts`, `collections`, `hunts` | None | ❌ |
 | `MCP_TRANSPORT` | `stdio` or `http` | `stdio` | ❌ |
 | `MCP_SERVER_HOST` | HTTP bind host | `127.0.0.1` | ❌ |
 | `MCP_SERVER_PORT` | HTTP port | `8000` | ❌ |
@@ -282,14 +282,16 @@ The server exposes the following MCP tools for Velociraptor integration:
   ```
 
 ### 2. GetAgentInfo
-- **Purpose**: Retrieve detailed information about a Velociraptor client by hostname or FQDN
-- **Parameters**:
-  - `hostname` (required): Hostname or FQDN of the client to search for
+- **Purpose**: Retrieve detailed information about a Velociraptor client by hostname/FQDN or client ID
+- **Parameters** (give exactly one):
+  - `hostname`: Hostname or FQDN of the client (exact match)
+  - `client_id`: Velociraptor client ID, e.g. `C.1234abcd`
 - **Usage**: Searches for a client and returns comprehensive details including client ID, OS information, agent version, and connection status
 - **Example**:
   ```json
   {"args": {"hostname": "workstation-01"}}
   {"args": {"hostname": "server.domain.com"}}
+  {"args": {"client_id": "C.194759cdaf0153c8"}}
   ```
 
 ### 3. RunVQLQueryTool
@@ -346,7 +348,9 @@ The server exposes the following MCP tools for Velociraptor integration:
   - `fields` (optional): Comma-separated string of fields to return (default: '*')
   - `max_retries` (optional): Number of times to retry if the flow hasn't finished (default: 5)
   - `retry_delay` (optional): Time in seconds to wait between retries (default: 5)
-- **Usage**: Waits and retries if the flow hasn't finished or if no results are immediately available. Supports partial results for multi-source artifacts.
+  - `wait` (optional): `false` checks once and returns at once; use it for existing collections (default: `true`)
+  - `limit` (optional): Maximum rows per artifact source, capped by `VELOCIRAPTOR_MAX_ROWS`
+- **Usage**: Waits and retries if the flow hasn't finished or if no results are immediately available. Supports partial results for multi-source artifacts. Completion is read from the flow's own state first, so hunt flows (`F.….H`) are recognised as finished.
 - **Features**:
   - **Multi-source support**: Handles artifacts with multiple sources (e.g., Linux.Debian.Packages with DebPackages/Snaps)
   - **Partial results**: Returns completed sources even if others are still running
@@ -355,6 +359,7 @@ The server exposes the following MCP tools for Velociraptor integration:
   ```json
   {"args": {"client_id": "C.1234567890", "flow_id": "F.ABC123", "artifact": "Windows.System.Users"}}
   {"args": {"client_id": "C.0987654321", "flow_id": "F.DEF456", "artifact": "Linux.System.Uptime", "fields": "Uptime,BootTime"}}
+  {"args": {"client_id": "C.1234567890", "flow_id": "F.ABC123", "artifact": "Windows.System.Users", "wait": false, "limit": 50}}
   ```
 
 ### 8. CollectArtifactDetailsTool
@@ -395,6 +400,23 @@ The server exposes the following MCP tools for Velociraptor integration:
 - **Example**:
   ```json
   {"args": {"artifact_name": "Windows.RemoteDesktop.RDPConnections"}}
+  ```
+
+### 12. ListHuntsTool
+- **Purpose**: List hunts, newest first, with hunt ID, state, artifacts and client counts (read-only)
+- **Parameters**: `limit` (optional, default 20)
+- **Example**: `{"args": {"limit": 10}}`
+
+### 13. GetHuntResultsTool
+- **Purpose**: Read the existing results of a hunt for one artifact (read-only; runs nothing on endpoints)
+- **Parameters**:
+  - `hunt_id` (required): e.g. `H.D8CNRTTL5AOMM`
+  - `artifact` (required): Artifact name. Artifacts with several sources must be given as `Artifact/Source`.
+  - `fields` (optional): Comma-separated fields (default `*`)
+  - `limit` (optional): Maximum rows, capped by `VELOCIRAPTOR_MAX_ROWS`
+- **Example**:
+  ```json
+  {"args": {"hunt_id": "H.D30PRBIDUCKO0", "artifact": "Linux.Execute.RemoteBashScript/ScriptExecution", "fields": "FlowId, Status", "limit": 20}}
   ```
 
 ### Artifact Collection Workflow
