@@ -357,7 +357,8 @@ class VelociraptorClient:
             env = {
                 "McpClientId": _check(client_id, _CLIENT_ID, "client_id"),
                 "McpFlowId": _check(flow_id, _FLOW_ID, "flow_id"),
-                "McpDonePattern": "^Collection " + re.escape(_check(artifact, _ARTIFACT, "artifact"))
+                "McpDonePattern": "^Collection "
+                + re.escape(_check(artifact, _ARTIFACT, "artifact"))
                 + " is done after",
             }
             results = self.run_vql_query(vql, env=env)

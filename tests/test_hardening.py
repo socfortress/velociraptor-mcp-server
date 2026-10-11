@@ -60,7 +60,9 @@ def test_unclassified_tool_counts_as_write(config):
 
 def test_disabled_categories(config):
     names = tool_names(make_server(config, disabled_categories=["artifacts"]))
-    assert not any("Artifact" in n and n.startswith("List") for n in names) and "GetAgentInfo" in names
+    assert (
+        not any("Artifact" in n and n.startswith("List") for n in names) and "GetAgentInfo" in names
+    )
 
 
 # --- MCP-1/2: transport and auth --------------------------------------------------------------------
@@ -74,10 +76,14 @@ def test_http_requires_token(config):
 @pytest.mark.asyncio
 async def test_http_auth_and_health(config):
     app = make_server(config, auth_token="s3cret").http_app()
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://t"
+    ) as client:
         assert (await client.get("/healthz")).json() == {"status": "ok"}
         assert (await client.post("/mcp", json={})).status_code == 401
-        assert (await client.post("/mcp", json={}, headers={"Authorization": "Bearer x"})).status_code == 401
+        assert (
+            await client.post("/mcp", json={}, headers={"Authorization": "Bearer x"})
+        ).status_code == 401
 
 
 def test_env_config(monkeypatch):
@@ -94,7 +100,10 @@ def test_env_config(monkeypatch):
 def test_max_rows_and_timeout_are_sent_and_capped(stubbed):
     client, grpc_stub = stubbed
     client.config.max_rows, client.config.timeout = 50, 30
-    grpc_stub.Query.return_value = [response([{"n": i} for i in range(40)]), response([{"n": i} for i in range(40)])]
+    grpc_stub.Query.return_value = [
+        response([{"n": i} for i in range(40)]),
+        response([{"n": i} for i in range(40)]),
+    ]
     rows = client.run_vql_query("SELECT * FROM clients()", max_rows=500, timeout=600)
     request, _ = sent(grpc_stub)
     assert (request.max_row, request.timeout) == (50, 30)  # never above the configured caps
@@ -122,7 +131,11 @@ def test_flow_results_parameterised_and_validated(stubbed):
     client.get_flow_results("C.abc123", "F.ABC123", "Windows.System.Users", "Name, Uid")
     request, env = sent(grpc_stub)
     assert "SELECT Name, Uid FROM source(client_id=McpClientId" in request.Query[0].VQL
-    assert env == {"McpClientId": "C.abc123", "McpFlowId": "F.ABC123", "McpArtifact": "Windows.System.Users"}
+    assert env == {
+        "McpClientId": "C.abc123",
+        "McpFlowId": "F.ABC123",
+        "McpArtifact": "Windows.System.Users",
+    }
     for bad in [
         ("C.abc123", "F.ABC123", "Windows.System.Users", "* FROM info() --"),
         ("C.abc'", "F.ABC123", "Windows.System.Users", "*"),
@@ -161,7 +174,10 @@ def test_artifact_lookup_tools_parameterised(config):
     server._client = mock_client
     tools = asyncio.run(server.app.get_tools())
     asyncio.run(tools["FindArtifactDetailsTool"].run({"args": {"artifact_name": "X' OR 1=1"}}))
-    vql, kwargs = mock_client.run_vql_query.call_args.args[0], mock_client.run_vql_query.call_args.kwargs
+    vql, kwargs = (
+        mock_client.run_vql_query.call_args.args[0],
+        mock_client.run_vql_query.call_args.kwargs,
+    )
     assert "X' OR" not in vql and kwargs["env"] == {"McpArtifactName": "X' OR 1=1"}
 
 
@@ -207,14 +223,18 @@ def test_find_client_by_id_parameterised(stubbed):
     client, grpc_stub = stubbed
     client.find_client_by_id("C.194759cdaf0153c8")
     request, env = sent(grpc_stub)
-    assert "clients(client_id=McpClientId)" in request.Query[0].VQL and env == {"McpClientId": "C.194759cdaf0153c8"}
+    assert "clients(client_id=McpClientId)" in request.Query[0].VQL and env == {
+        "McpClientId": "C.194759cdaf0153c8"
+    }
     with pytest.raises(ValueError):
         client.find_client_by_id("C.1') OR (1")
 
 
 def test_hunt_results_parameterised(stubbed):
     client, grpc_stub = stubbed
-    client.get_hunt_results("H.D8CNRTTL5AOMM", "Windows.System.Pslist/Main", "Name, Pid", max_rows=5)
+    client.get_hunt_results(
+        "H.D8CNRTTL5AOMM", "Windows.System.Pslist/Main", "Name, Pid", max_rows=5
+    )
     request, env = sent(grpc_stub)
     assert "SELECT Name, Pid FROM hunt_results(hunt_id=McpHuntId" in request.Query[0].VQL
     assert env == {"McpHuntId": "H.D8CNRTTL5AOMM", "McpArtifact": "Windows.System.Pslist/Main"}
@@ -227,7 +247,10 @@ def test_flow_status_uses_flow_state_first(velociraptor_client, mock_grpc_client
     """Hunt flows log a different completion message; the flow's own state is authoritative."""
     velociraptor_client.stub = mock_grpc_client
     mock_grpc_client.Query.return_value = [response([{"state": "FINISHED"}])]
-    assert velociraptor_client.get_flow_status("C.abc123", "F.D2MSOOHV9UR3S.H", "Linux.Sys.Users") == "FINISHED"
+    assert (
+        velociraptor_client.get_flow_status("C.abc123", "F.D2MSOOHV9UR3S.H", "Linux.Sys.Users")
+        == "FINISHED"
+    )
     assert mock_grpc_client.Query.call_count == 1
 
 
@@ -246,18 +269,29 @@ def test_get_agent_info_by_client_id(config):
     _, tools = _tool_server(config, find_client_by_id=lookup)
     result = asyncio.run(tools["GetAgentInfo"].run({"args": {"client_id": "C.abc123"}}))
     assert "C.abc123" in result.content[0].text and lookup.called
-    both = asyncio.run(tools["GetAgentInfo"].run({"args": {"client_id": "C.abc123", "hostname": "h"}}))
-    assert "exactly one" in both.content[0].text
+    from fastmcp.exceptions import ToolError
+
+    with pytest.raises(ToolError, match="exactly one"):
+        asyncio.run(tools["GetAgentInfo"].run({"args": {"client_id": "C.abc123", "hostname": "h"}}))
 
 
 def test_collection_results_no_wait_and_limit(config):
     status = Mock(return_value="RUNNING")
     results = Mock(return_value=[])
     artifacts = Mock(return_value=[{"name": "Windows.Sys.Users", "source_names": []}])
-    _, tools = _tool_server(config, get_flow_status=status, get_flow_results=results, run_vql_query=artifacts)
-    args = {"client_id": "C.abc123", "flow_id": "F.ABC", "artifact": "Windows.Sys.Users", "wait": False}
+    _, tools = _tool_server(
+        config, get_flow_status=status, get_flow_results=results, run_vql_query=artifacts
+    )
+    args = {
+        "client_id": "C.abc123",
+        "flow_id": "F.ABC",
+        "artifact": "Windows.Sys.Users",
+        "wait": False,
+    }
     out = asyncio.run(tools["GetCollectionResultsTool"].run({"args": args}))
-    assert status.call_count == 1 and "after 1 retries" in out.content[0].text  # no sleeping, one check
+    assert (
+        status.call_count == 1 and "after 1 retries" in out.content[0].text
+    )  # no sleeping, one check
 
     status.return_value = "FINISHED"
     asyncio.run(tools["GetCollectionResultsTool"].run({"args": {**args, "limit": 7}}))
@@ -267,3 +301,32 @@ def test_collection_results_no_wait_and_limit(config):
 def test_hunt_tools_registered_and_read_only(config):
     names = tool_names(make_server(config, read_only=True))
     assert {"ListHuntsTool", "GetHuntResultsTool"} <= names
+
+
+# --- MCP-5 / MCP-8: bounded compact output, structured errors -----------------------------------
+
+
+def test_rows_are_compact_and_truncation_is_counted(config):
+    config.server.max_output_chars = 2000
+    server = make_server(config)
+    rows = [{"Name": f"proc-{i}", "Pid": i, "CommandLine": "x" * 100} for i in range(100)]
+    out = server._fit_rows(rows)
+    body, marker = out.rsplit("\n", 1)
+    kept = json.loads(body)
+    assert len(out) <= 2000 and "\n " not in body
+    assert marker.startswith(f"[truncated: showing {len(kept)} of 100 rows")
+
+
+def test_small_results_are_plain_json(config):
+    assert make_server(config)._fit_rows([{"a": 1}]) == '[{"a":1}]'
+
+
+def test_backend_error_is_a_tool_error(config):
+    from fastmcp.exceptions import ToolError
+
+    def boom(*_a, **_k):
+        raise RuntimeError("rpc error: PERMISSION_DENIED")
+
+    _, tools = _tool_server(config, run_vql_query=boom)
+    with pytest.raises(ToolError, match="PERMISSION_DENIED"):
+        asyncio.run(tools["ListLinuxArtifactNamesTool"].run({"args": {}}))

@@ -10,6 +10,7 @@ from typing import Dict, Optional, Tuple
 
 import uvicorn
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 from starlette.middleware import Middleware
 from starlette.requests import Request
@@ -31,7 +32,9 @@ class AuthenticateArgs(BaseModel):
 class GetAgentInfoArgs(BaseModel):
     """Arguments for getting agent information by hostname/FQDN or client ID (give one)."""
 
-    hostname: Optional[str] = Field(None, description="Hostname or FQDN of the client to search for")
+    hostname: Optional[str] = Field(
+        None, description="Hostname or FQDN of the client to search for"
+    )
     client_id: Optional[str] = Field(None, description="Velociraptor client ID, e.g. C.1234abcd")
 
 
@@ -40,10 +43,13 @@ class GetHuntResultsArgs(BaseModel):
 
     hunt_id: str = Field(..., description="Hunt ID, e.g. H.D8CNRTTL5AOMM")
     artifact: str = Field(
-        ..., description="Artifact name, optionally with a source (e.g. Windows.System.Pslist or Artifact/Source)"
+        ...,
+        description="Artifact name, optionally with a source (e.g. Windows.System.Pslist or Artifact/Source)",
     )
     fields: str = Field("*", description="Comma-separated fields to return (default '*')")
-    limit: Optional[int] = Field(None, description="Maximum rows to return (capped by VELOCIRAPTOR_MAX_ROWS)")
+    limit: Optional[int] = Field(
+        None, description="Maximum rows to return (capped by VELOCIRAPTOR_MAX_ROWS)"
+    )
 
 
 class ListHuntsArgs(BaseModel):
@@ -183,7 +189,7 @@ class VelociraptorMCPServer:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._client: Optional[VelociraptorClient] = None
-        self.app = FastMCP(name="Velociraptor MCP Server", version="0.1.0")
+        self.app = FastMCP(name="Velociraptor MCP Server", version="0.2.0")
 
         # Register tools
         self._register_tools()
@@ -232,15 +238,10 @@ class VelociraptorMCPServer:
                 try:
                     client = self._get_client()
                     result = await client.authenticate()
-                    return [
-                        {
-                            "type": "text",
-                            "text": f"Authentication successful: {json.dumps(result, indent=2)}",
-                        },
-                    ]
+                    return f"Authentication successful: {self._dumps(result)}"
                 except Exception as e:
                     logger.error("Authentication failed: %s", e)
-                    return [{"type": "text", "text": f"Authentication failed: {str(e)}"}]
+                    return f"Authentication failed: {str(e)}"
 
         if self._enabled("GetAgentInfo"):
 
@@ -275,36 +276,28 @@ class VelociraptorMCPServer:
 
                     # Use the find_client_info method from the client
                     if bool(args.hostname) == bool(args.client_id):
-                        return [
-                            {"type": "text", "text": "Provide exactly one of 'hostname' or 'client_id'."},
-                        ]
+                        raise ToolError("Provide exactly one of 'hostname' or 'client_id'.")
                     if args.client_id:
                         label, kind = args.client_id, "client_id"
-                        client_info = await asyncio.to_thread(client.find_client_by_id, args.client_id)
+                        client_info = await asyncio.to_thread(
+                            client.find_client_by_id, args.client_id
+                        )
                     else:
                         label, kind = args.hostname, "hostname"
-                        client_info = await asyncio.to_thread(client.find_client_info, args.hostname)
+                        client_info = await asyncio.to_thread(
+                            client.find_client_info, args.hostname
+                        )
 
                     if client_info is None:
-                        return [
-                            {
-                                "type": "text",
-                                "text": f"No client found with {kind}: {label}",
-                            },
-                        ]
+                        return f"No client found with {kind}: {label}"
 
                     # Format the response
-                    response_text = json.dumps(client_info, indent=2)
+                    response_text = self._dumps(client_info)
 
-                    return [
-                        {
-                            "type": "text",
-                            "text": f"Client information for '{label}':\n{response_text}",
-                        },
-                    ]
+                    return f"Client information for '{label}':\n{response_text}"
                 except Exception as e:
                     logger.error("Failed to get agent info: %s", e)
-                    return [{"type": "text", "text": f"Error getting agent info: {str(e)}"}]
+                    raise ToolError(f"Error getting agent info: {str(e)}") from e
 
         if self._enabled("RunVQLQueryTool"):
 
@@ -349,17 +342,10 @@ class VelociraptorMCPServer:
                     )
 
                     # Format the response
-                    response_text = json.dumps(results, indent=2)
-
-                    return [
-                        {
-                            "type": "text",
-                            "text": self._safe_truncate(response_text),
-                        },
-                    ]
+                    return self._fit_rows(results)
                 except Exception as e:
                     logger.error("Failed to execute VQL query: %s", e)
-                    return [{"type": "text", "text": f"Error executing VQL query: {str(e)}"}]
+                    raise ToolError(f"Error executing VQL query: {str(e)}") from e
 
         if self._enabled("ListLinuxArtifactNamesTool"):
 
@@ -376,13 +362,10 @@ class VelociraptorMCPServer:
                     vql = "SELECT name FROM artifact_definitions() WHERE type =~ 'client' AND name =~ 'linux\\.'"
                     results = await asyncio.to_thread(client.run_vql_query, vql)
                     names = [r["name"] for r in results if "name" in r]
-                    response_text = json.dumps(names, indent=2)
-                    return [{"type": "text", "text": self._safe_truncate(response_text)}]
+                    return self._fit_rows(names)
                 except Exception as e:
                     logger.error("Failed to list Linux artifact names: %s", e)
-                    return [
-                        {"type": "text", "text": f"Error listing Linux artifact names: {str(e)}"},
-                    ]
+                    raise ToolError(f"Error listing Linux artifact names: {str(e)}") from e
 
         if self._enabled("ListWindowsArtifactNamesTool"):
 
@@ -399,13 +382,10 @@ class VelociraptorMCPServer:
                     vql = "SELECT name FROM artifact_definitions() WHERE type =~ 'client' AND name =~ '^windows\\.'"
                     results = await asyncio.to_thread(client.run_vql_query, vql)
                     names = [r["name"] for r in results if "name" in r]
-                    response_text = json.dumps(names, indent=2)
-                    return [{"type": "text", "text": self._safe_truncate(response_text)}]
+                    return self._fit_rows(names)
                 except Exception as e:
                     logger.error("Failed to list Windows artifact names: %s", e)
-                    return [
-                        {"type": "text", "text": f"Error listing Windows artifact names: {str(e)}"},
-                    ]
+                    raise ToolError(f"Error listing Windows artifact names: {str(e)}") from e
 
         if self._enabled("ListLinuxArtifactsTool"):
 
@@ -457,17 +437,10 @@ class VelociraptorMCPServer:
                         )
 
                     # Format the response
-                    response_text = json.dumps(summaries, indent=2)
-
-                    return [
-                        {
-                            "type": "text",
-                            "text": self._safe_truncate(response_text),
-                        },
-                    ]
+                    return self._fit_rows(summaries)
                 except Exception as e:
                     logger.error("Failed to list Linux artifacts: %s", e)
-                    return [{"type": "text", "text": f"Error listing Linux artifacts: {str(e)}"}]
+                    raise ToolError(f"Error listing Linux artifacts: {str(e)}") from e
 
         if self._enabled("ListWindowsArtifactsTool"):
 
@@ -523,17 +496,10 @@ class VelociraptorMCPServer:
                         )
 
                     # Format the response
-                    response_text = json.dumps(summaries, indent=2)
-
-                    return [
-                        {
-                            "type": "text",
-                            "text": self._safe_truncate(response_text),
-                        },
-                    ]
+                    return self._fit_rows(summaries)
                 except Exception as e:
                     logger.error("Failed to list Windows artifacts: %s", e)
-                    return [{"type": "text", "text": f"Error listing Windows artifacts: {str(e)}"}]
+                    raise ToolError(f"Error listing Windows artifacts: {str(e)}") from e
 
         if self._enabled("FindArtifactDetailsTool"):
 
@@ -565,12 +531,7 @@ class VelociraptorMCPServer:
                         client.run_vql_query, vql, env={"McpArtifactName": args.artifact_name}
                     )
                     if not results:
-                        return [
-                            {
-                                "type": "text",
-                                "text": f"No artifact found with name: {args.artifact_name}",
-                            },
-                        ]
+                        return f"No artifact found with name: {args.artifact_name}"
                     artifact = results[0]
                     # Only keep relevant parameter fields
                     parameters = [
@@ -587,11 +548,11 @@ class VelociraptorMCPServer:
                         "description": artifact.get("description", ""),
                         "parameters": parameters,
                     }
-                    response_text = json.dumps(summary, indent=2)
-                    return [{"type": "text", "text": self._safe_truncate(response_text)}]
+                    response_text = self._dumps(summary)
+                    return self._safe_truncate(response_text)
                 except Exception as e:
                     logger.error("Failed to find artifact details: %s", e)
-                    return [{"type": "text", "text": f"Error finding artifact details: {str(e)}"}]
+                    raise ToolError(f"Error finding artifact details: {str(e)}") from e
 
         if self._enabled("CollectArtifactTool"):
 
@@ -628,7 +589,7 @@ class VelociraptorMCPServer:
 
                     # Start the collection using the client's start_collection method
                     response = await asyncio.to_thread(
-                                        client.start_collection,
+                        client.start_collection,
                         args.client_id,
                         args.artifact,
                         args.parameters,
@@ -640,25 +601,15 @@ class VelociraptorMCPServer:
                         or not response
                         or "flow_id" not in response[0]
                     ):
-                        return [
-                            {
-                                "type": "text",
-                                "text": f"Failed to start collection: {json.dumps(response, indent=2)}",
-                            },
-                        ]
+                        raise ToolError(f"Failed to start collection: {self._dumps(response)}")
 
                     # Format the response
-                    response_text = json.dumps(response[0], indent=2)
+                    response_text = self._dumps(response[0])
 
-                    return [
-                        {
-                            "type": "text",
-                            "text": f"Collection started successfully:\n{response_text}",
-                        },
-                    ]
+                    return f"Collection started successfully:\n{response_text}"
                 except Exception as e:
                     logger.error("Failed to collect artifact: %s", e)
-                    return [{"type": "text", "text": f"Error collecting artifact: {str(e)}"}]
+                    raise ToolError(f"Error collecting artifact: {str(e)}") from e
 
         if self._enabled("GetCollectionResultsTool"):
 
@@ -699,7 +650,9 @@ class VelociraptorMCPServer:
                     # First, get artifact details to check if it has multiple sources
                     artifact_details_vql = "SELECT name,sources.name as source_names FROM artifact_definitions() WHERE name = McpArtifactName"
                     artifact_details = await asyncio.to_thread(
-                        client.run_vql_query, artifact_details_vql, env={"McpArtifactName": args.artifact}
+                        client.run_vql_query,
+                        artifact_details_vql,
+                        env={"McpArtifactName": args.artifact},
                     )
 
                     source_names = []
@@ -743,7 +696,7 @@ class VelociraptorMCPServer:
                                 artifact_with_source not in all_results
                             ):  # Only check if we haven't gotten results yet
                                 status = await asyncio.to_thread(
-                                        client.get_flow_status,
+                                    client.get_flow_status,
                                     args.client_id,
                                     args.flow_id,
                                     artifact_with_source,
@@ -810,19 +763,16 @@ class VelociraptorMCPServer:
                             incomplete_sources,
                         )
                     else:
-                        return [
-                            {
-                                "type": "text",
-                                "text": f"Collection results not available after {attempts} retries. "
-                                f"Flow {args.flow_id} may still be running or may have failed. "
-                                f"Try again later or check the Velociraptor UI for flow status. "
-                                f"Checked artifacts: {artifacts_to_check}",
-                            },
-                        ]
+                        return (
+                            f"Collection results not available after {attempts} retries. "
+                            f"Flow {args.flow_id} may still be running or may have failed. "
+                            f"Try again later or check the Velociraptor UI for flow status. "
+                            f"Checked artifacts: {artifacts_to_check}"
+                        )
 
                 except Exception as e:
                     logger.error("Failed to get collection results: %s", e)
-                    return [{"type": "text", "text": f"Error getting collection results: {str(e)}"}]
+                    raise ToolError(f"Error getting collection results: {str(e)}") from e
 
         if self._enabled("ListHuntsTool"):
 
@@ -837,10 +787,10 @@ class VelociraptorMCPServer:
                     if client.stub is None:
                         await client.authenticate()
                     hunts = await asyncio.to_thread(client.list_hunts, max_rows=args.limit)
-                    return [{"type": "text", "text": self._safe_truncate(json.dumps(hunts, indent=2))}]
+                    return self._fit_rows(hunts)
                 except Exception as e:
                     logger.error("Failed to list hunts: %s", e)
-                    return [{"type": "text", "text": f"Error listing hunts: {str(e)}"}]
+                    raise ToolError(f"Error listing hunts: {str(e)}") from e
 
         if self._enabled("GetHuntResultsTool"):
 
@@ -859,15 +809,17 @@ class VelociraptorMCPServer:
                     if client.stub is None:
                         await client.authenticate()
                     rows = await asyncio.to_thread(
-                        client.get_hunt_results, args.hunt_id, args.artifact, args.fields, max_rows=args.limit
+                        client.get_hunt_results,
+                        args.hunt_id,
+                        args.artifact,
+                        args.fields,
+                        max_rows=args.limit,
                     )
                     header = f"Hunt {args.hunt_id} results for {args.artifact}: {len(rows)} rows"
-                    return [
-                        {"type": "text", "text": f"{header}\n{self._safe_truncate(json.dumps(rows, indent=2))}"},
-                    ]
+                    return f"{header}\n{self._fit_rows(rows)}"
                 except Exception as e:
                     logger.error("Failed to get hunt results: %s", e)
-                    return [{"type": "text", "text": f"Error getting hunt results: {str(e)}"}]
+                    raise ToolError(f"Error getting hunt results: {str(e)}") from e
 
         if self._enabled("CollectArtifactDetailsTool"):
 
@@ -913,12 +865,7 @@ class VelociraptorMCPServer:
                     )
 
                     if not results:
-                        return [
-                            {
-                                "type": "text",
-                                "text": f"No artifact found with name: {args.artifact_name}",
-                            },
-                        ]
+                        return f"No artifact found with name: {args.artifact_name}"
 
                     # Get the first (and should be only) result
                     artifact_details = results[0]
@@ -935,34 +882,56 @@ class VelociraptorMCPServer:
                         "source_count": len(source_names) if source_names else 0,
                     }
 
-                    response_text = json.dumps(formatted_details, indent=2)
+                    response_text = self._dumps(formatted_details)
 
-                    return [
-                        {
-                            "type": "text",
-                            "text": f"Artifact details for '{args.artifact_name}':\n{response_text}",
-                        },
-                    ]
+                    return f"Artifact details for '{args.artifact_name}':\n{response_text}"
 
                 except Exception as e:
                     logger.error("Failed to get artifact details: %s", e)
-                    return [{"type": "text", "text": f"Error getting artifact details: {str(e)}"}]
+                    raise ToolError(f"Error getting artifact details: {str(e)}") from e
 
-    def _safe_truncate(self, text: str, max_length: int = 32000) -> str:
-        """Truncate text to avoid overwhelming the client."""
+    @staticmethod
+    def _dumps(value) -> str:
+        """Compact JSON for tool output."""
+        return json.dumps(value, separators=(",", ":"), default=str)
+
+    def _safe_truncate(self, text: str, max_length: Optional[int] = None) -> str:
+        """Cut text to the output limit, saying how much was cut."""
+        max_length = max_length or self.config.server.max_output_chars
         if len(text) <= max_length:
             return text
-        return text[:max_length] + f"\n\n[... truncated {len(text) - max_length} characters ...]"
+        return (
+            text[:max_length] + f"\n\n[truncated: showing {max_length} of {len(text)} characters]"
+        )
+
+    def _fit_rows(self, rows: list) -> str:
+        """Compact JSON array of rows, dropping whole rows to fit the output limit.
+
+        When rows are dropped, a final line states how many rows are shown out of how many and the
+        original size, so a partial answer is never mistaken for a complete one.
+        """
+        limit = self.config.server.max_output_chars
+        text = self._dumps(rows)
+        if len(text) <= limit or not isinstance(rows, list) or not rows:
+            return self._safe_truncate(text, limit)
+        original_rows, original_chars = len(rows), len(text)
+        kept = list(rows)
+        while len(kept) > 1:
+            kept = kept[: max(len(kept) * 3 // 4, len(kept) - 1)]
+            text = self._dumps(kept)
+            if len(text) <= limit - 200:
+                break
+        else:
+            text = self._safe_truncate(self._dumps(kept), limit - 200)
+        return (
+            f"{text}\n[truncated: showing {len(kept)} of {original_rows} rows "
+            f"({original_chars} characters); request fewer fields or a lower limit]"
+        )
 
     def _format_collection_results(self, args, artifacts_to_check, all_results, incomplete_sources):
         """Format collection results with support for partial results."""
         if not all_results:
-            return [
-                {
-                    "type": "text",
-                    "text": f"Flow {args.flow_id} completed but no results were found for artifact {args.artifact}",
-                },
-            ]
+            return f"Flow {args.flow_id} completed but no results were found for artifact {args.artifact}"
 
         # Determine if we have partial results
         has_incomplete_sources = bool(incomplete_sources)
@@ -971,18 +940,11 @@ class VelociraptorMCPServer:
             # Single artifact/source
             artifact_name = artifacts_to_check[0]
             results = all_results.get(artifact_name, [])
-            response_text = json.dumps(results, indent=2)
-
             status_msg = ""
             if has_incomplete_sources:
                 status_msg = f"\n\n⚠️  WARNING: This collection timed out. Some sources may still be running: {', '.join(incomplete_sources)}"
 
-            return [
-                {
-                    "type": "text",
-                    "text": f"Collection results for flow {args.flow_id} (artifact: {artifact_name}):\n{self._safe_truncate(response_text)}{status_msg}",
-                },
-            ]
+            return f"Collection results for flow {args.flow_id} (artifact: {artifact_name}):\n{self._fit_rows(results or [])}{status_msg}"
         else:
             # Multiple sources - combine results
             completed_count = len(all_results)
@@ -1005,7 +967,7 @@ class VelociraptorMCPServer:
             else:
                 combined_response["status"] = "complete"
 
-            response_text = json.dumps(combined_response, indent=2)
+            response_text = self._dumps(combined_response)
 
             status_msg = ""
             if has_incomplete_sources:
@@ -1019,12 +981,7 @@ class VelociraptorMCPServer:
             collection_type = (
                 "with partial results" if has_incomplete_sources else "with multiple sources"
             )
-            return [
-                {
-                    "type": "text",
-                    "text": f"Collection results for flow {args.flow_id} (artifact: {args.artifact} {collection_type}):\n{self._safe_truncate(response_text)}{status_msg}",
-                },
-            ]
+            return f"Collection results for flow {args.flow_id} (artifact: {args.artifact} {collection_type}):\n{self._safe_truncate(response_text)}{status_msg}"
 
     def _normalize_args(self, raw_args, model_class):
         """Normalize arguments to handle both direct and wrapped formats."""
@@ -1059,7 +1016,9 @@ class VelociraptorMCPServer:
         if server.transport == "http":
             host = host or server.host
             port = port or server.port
-            logger.info("Starting Velociraptor MCP Server (HTTP transport) on %s:%s/mcp", host, port)
+            logger.info(
+                "Starting Velociraptor MCP Server (HTTP transport) on %s:%s/mcp", host, port
+            )
             uvicorn.run(self.http_app(), host=host, port=port, log_level=server.log_level.lower())
             return
 

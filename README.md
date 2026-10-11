@@ -170,6 +170,27 @@ pre-commit install
 
 Untrusted values (hostnames, client and flow IDs, artifact names, collection parameters) are passed to Velociraptor as query variables, never spliced into VQL text. Field lists are validated as identifiers.
 
+### Output and errors
+
+- **Output.** Responses are compact JSON, capped at `MCP_MAX_OUTPUT_CHARS` (default 32000). When a row result is too large, whole rows are dropped and the response ends with `[truncated: showing N of M rows (X characters)]`. Use `fields` and `limit` to keep results small.
+- **Errors.** Backend failures and invalid arguments are returned as MCP tool errors (`isError: true`). "Not found" answers are normal results.
+
+### Docker
+
+```bash
+docker build -t velociraptor-mcp-server .
+docker run --env-file .env -p 127.0.0.1:8000:8000 \
+  -v ./api.config.yaml:/config/api.config.yaml:ro velociraptor-mcp-server   # HTTP on :8000, needs MCP_AUTH_TOKEN
+```
+
+The image runs as a non-root user and has a health check on `/healthz`. It never contains an API config: mount yours read-only (`VELOCIRAPTOR_API_KEY` defaults to `/config/api.config.yaml`).
+
+Images are published to `ghcr.io/socfortress/velociraptor-mcp-server`:
+- `main` and `sha-…` on every push to main
+- `X.Y.Z` and `X.Y` for `vX.Y.Z` tags
+
+See `CHANGELOG.md`.
+
 ### CLI Options
 
 ```bash
